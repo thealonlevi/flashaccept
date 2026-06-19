@@ -14,7 +14,7 @@ LOGDIR="$RESULTS_DIR/loop-logs"; mkdir -p "$LOGDIR"
 MAX_ITERS="${MAX_ITERS:-1000000}"
 log(){ echo "[loop $(date +%H:%M:%S)] $*"; }
 ITERCSV="$LOGDIR/iterations.csv"; CUM_COST=0
-[ -f "$ITERCSV" ] || echo "iter,utc,arm,score,champion,verdict,ceiling,cost_usd,cum_cost_usd,in_tokens" > "$ITERCSV"
+[ -f "$ITERCSV" ] || echo "iter,utc,arm,model,score,champion,verdict,ceiling,cost_usd,cum_cost_usd,in_tokens" > "$ITERCSV"
 
 # treatment is a subdir of this monorepo; git ops are scoped to treatment/ + kbs/ so a revert
 # never touches the fixed harness/referee. (Each iteration only mutates those two paths.)
@@ -32,9 +32,13 @@ while [ "$iter" -lt "$MAX_ITERS" ]; do
   # ---------- ANALYTICS phase (CH active; SUT not under measurement) ----------
   harness/flush-ch.sh || true
   PRE_HEAD="$(treat_head)"
+  # model tiering: cheap Sonnet most iters, periodic Opus for a deeper attempt
+  MODEL="$OPT_MODEL"
+  [ "${DEEP_EVERY:-0}" -gt 0 ] && [ $((iter % DEEP_EVERY)) -eq 0 ] && MODEL="$DEEP_MODEL"
+  log "model=$MODEL"
   out=$(timeout "$ITER_TIMEOUT" env IS_SANDBOX=1 claude -p "$(cat harness/optimizer-prompt.md)" \
         ${SID:+--resume "$SID"} \
-        --model "$OPT_MODEL" \
+        --model "$MODEL" \
         --append-system-prompt-file harness/optimizer-system.md \
         --add-dir "$PWD/treatment" \
         --mcp-config harness/mcp-clickhouse.json \
@@ -79,8 +83,22 @@ while [ "$iter" -lt "$MAX_ITERS" ]; do
     VERDICT="revert-regression"; log "not better -> revert (never keep a regression)"; git reset --hard HEAD~1 -q; no_improve=$((no_improve+1))
   fi
   CUM_COST=$(awk -v a="$CUM_COST" -v b="${cost:-0}" 'BEGIN{printf "%.4f", a+b}')
-  printf '%d,%s,treatment,%s,%s,%s,%s,%s,%s,%s\n' "$iter" "$(date -u +%FT%TZ)" "$score" "$best" \
+  utc="$(date -u +%FT%TZ)"
+  printf '%d,%s,treatment,%s,%s,%s,%s,%s,%s,%s,%s\n' "$iter" "$utc" "$MODEL" "$score" "$best" \
     "$VERDICT" "$ceil" "${cost:-0}" "$CUM_COST" "${intok:-0}" >> "$ITERCSV"
+  # economics + hypothesis -> ClickHouse (analytics phase; CH active). Best-effort.
+  HYP_J="$HYP" ITER="$iter" MODEL_J="$MODEL" SCORE_J="$score" CHAMP_J="$best" VERD_J="$VERDICT" \
+  CEIL_J="$ceil" COST_J="${cost:-0}" CUM_J="$CUM_COST" TOK_J="${intok:-0}" UTC_J="$utc" \
+  python3 - <<'PY' 2>/dev/null || true
+import os,json,subprocess
+e=os.environ
+row={"ts":e["UTC_J"].replace("T"," ").replace("Z",""),"iter":int(e["ITER"]),"runid":"",
+     "model":e["MODEL_J"],"score":float(e["SCORE_J"]),"champion":float(e["CHAMP_J"]),
+     "verdict":e["VERD_J"],"ceiling":e["CEIL_J"],"cost_usd":float(e["COST_J"]),
+     "cum_cost_usd":float(e["CUM_J"]),"in_tokens":int(e["TOK_J"]),"hypothesis":e["HYP_J"][:500]}
+subprocess.run(["clickhouse-client","--query","INSERT INTO acceptbench.iterations FORMAT JSONEachRow"],
+               input=json.dumps(row),text=True,timeout=10)
+PY
 
   # ---------- control-drift watchdog every K iterations ----------
   if [ $((iter % K)) -eq 0 ]; then

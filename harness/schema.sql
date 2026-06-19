@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS acceptbench.runs (
   sysc_close          Float64,
   sysc_epoll_wait     Float64,
   perf_ipc            Float64,
+  perf_instr_pc       Float64,             -- instructions per connection (frequency-independent)
   perf_llc_miss_pc    Float64,
   perf_ctxsw_pc       Float64,
   kernel              String,
@@ -59,3 +60,20 @@ CREATE TABLE IF NOT EXISTS acceptbench.samples (
   p99_accept_ms Float64
 ) ENGINE = MergeTree ORDER BY (runid, step_idx, t_offset_s)
   TTL ts + INTERVAL 30 DAY;
+
+-- one row per optimizer iteration: economics + the agent's hypothesis + verdict + model.
+-- Lets you correlate spend/model with progress and read what each idea was.
+CREATE TABLE IF NOT EXISTS acceptbench.iterations (
+  ts           DateTime,
+  iter         UInt32,
+  runid        String,
+  model        LowCardinality(String),
+  score        Float64,
+  champion     Float64,
+  verdict      LowCardinality(String),     -- promote | revert-regression | revert-fail
+  ceiling      LowCardinality(String),
+  cost_usd     Float64,
+  cum_cost_usd Float64,
+  in_tokens    UInt64,
+  hypothesis   String
+) ENGINE = MergeTree ORDER BY (ts);

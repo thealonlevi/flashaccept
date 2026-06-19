@@ -104,7 +104,8 @@ def api_state():
               f"FROM {CH_DB}.runs ORDER BY ts DESC LIMIT 25")
     # treatment score + lever trajectory from CH (oldest->newest)
     traj = ch(f"SELECT toString(ts) AS ts, round(score,1) AS score, max_sustained_conn_s AS conn_s, "
-              f"round(sysc_io_uring_enter,3) AS enter_pc FROM {CH_DB}.runs "
+              f"round(sysc_io_uring_enter,3) AS enter_pc, round(perf_instr_pc,0) AS instr_pc, "
+              f"round(perf_ipc,3) AS ipc, round(spread_pct,1) AS spread FROM {CH_DB}.runs "
               f"WHERE arm='treatment' AND gate_passed=1 ORDER BY ts ASC LIMIT 500")
     return {
         "now": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -164,11 +165,15 @@ small{color:var(--mut)}
 <div class=cards id=cards></div>
 <div class=grid2>
  <div class=panel><h2>score per iteration (treatment vs control baseline)</h2><canvas id=cScore height=140></canvas></div>
- <div class=panel><h2>io_uring_enter per connection — the syscall lever (lower = better)</h2><canvas id=cLever height=140></canvas></div>
+ <div class=panel><h2>instructions per connection — frequency-independent (cleaner than score; lower = better)</h2><canvas id=cInstr height=140></canvas></div>
+</div>
+<div class=grid2>
+ <div class=panel><h2>io_uring_enter per connection — syscall lever (lower = better)</h2><canvas id=cLever height=120></canvas></div>
+ <div class=panel><h2>max sustained conn/s</h2><canvas id=cConn height=120></canvas></div>
 </div>
 <div class=grid2>
  <div class=panel><h2>cumulative cost ($)</h2><canvas id=cCost height=120></canvas></div>
- <div class=panel><h2>max sustained conn/s</h2><canvas id=cConn height=120></canvas></div>
+ <div class=panel><h2>IPC (instructions per cycle)</h2><canvas id=cIpc height=120></canvas></div>
 </div>
 <div class=panel><h2>recent runs</h2><div style=overflow-x:auto><table id=runs></table></div></div>
 <div class=grid2>
@@ -199,12 +204,15 @@ async function tick(){
  const champ=s.champion||{}, cb=s.control_baseline;
  const t=s.totals;
  const patPct=lp.patience?Math.round(100*lp.no_improve/lp.patience):0;
+ const its0=s.iterations||[]; const lastModel=its0.length?its0[its0.length-1].model:'—';
+ const lastSpread=(s.trajectory&&s.trajectory.length)?s.trajectory[s.trajectory.length-1].spread:null;
  document.getElementById('cards').innerHTML=[
   card('champion score',(champ.score??'—'),cb!=null?`vs control ${cb}`:''),
   card('iterations',t.iterations,`${t.promotes} kept · ${t.reverts} reverted`),
   card('current iter',lp.iter||'—',`plateau ${lp.no_improve}/${lp.patience}<div class=bar><i style="width:${patPct}%"></i></div>`),
-  card('tokens used',fmt(t.tokens),'claude -p input'),
-  card('cost spent','$'+(t.cost_usd||'0'),'cumulative'),
+  card('measurement spread',lastSpread!=null?lastSpread+'%':'—','run-to-run noise floor'),
+  card('model',lastModel,'last iteration'),
+  card('cost spent','$'+(t.cost_usd||'0'),`${fmt(t.tokens)} tok · cumulative`),
  ].join('');
  // trajectory (CH, treatment) + iterations (csv)
  const tr=s.trajectory||[], its=s.iterations||[];
@@ -214,9 +222,11 @@ async function tick(){
    {label:'champion',data:its.map(r=>+r.champion),borderColor:C.grn,borderDash:[4,4],pointRadius:0},
    ...(cb!=null?[{label:'control baseline',data:its.map(()=>cb),borderColor:C.yel,borderDash:[2,3],pointRadius:0}]:[])
  ]);
+ mkLine('cInstr',tr.map((_,i)=>i+1),[{label:'instructions / conn',data:tr.map(r=>+r.instr_pc),borderColor:C.yel,backgroundColor:'transparent',pointRadius:2,tension:.2}]);
  mkLine('cLever',tr.map((_,i)=>i+1),[{label:'io_uring_enter / conn',data:tr.map(r=>+r.enter_pc),borderColor:C.red,backgroundColor:'transparent',pointRadius:2,tension:.2}]);
  mkLine('cCost',labs,[{label:'cum $',data:its.map(r=>+r.cum_cost_usd),borderColor:C.grn,fill:true,backgroundColor:'rgba(63,185,80,.08)',pointRadius:0}]);
  mkLine('cConn',tr.map((_,i)=>i+1),[{label:'conn/s',data:tr.map(r=>+r.conn_s),borderColor:C.blu,backgroundColor:'transparent',pointRadius:2,tension:.2}]);
+ mkLine('cIpc',tr.map((_,i)=>i+1),[{label:'IPC',data:tr.map(r=>+r.ipc),borderColor:C.grn,backgroundColor:'transparent',pointRadius:2,tension:.2}]);
  // runs table
  document.getElementById('runs').innerHTML='<tr><th>time</th><th>arm</th><th>score</th><th>conn/s</th><th>io_uring_enter/c</th><th>accept4/c</th><th>drop</th><th>ceiling</th></tr>'+
   (s.runs||[]).map(r=>`<tr><td><small>${(r.ts||'').slice(5,19)}</small></td><td class="t-${r.arm}">${r.arm}</td><td>${r.score}</td><td>${r.conn_s}</td><td>${r.enter_pc}</td><td>${r.accept_pc}</td><td>${r.drop}</td><td>${r.ceiling}</td></tr>`).join('');

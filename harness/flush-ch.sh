@@ -17,17 +17,17 @@ total=$(wc -l < "$HISTORY")
 HIST="$HISTORY" START="$last" CHDB="$CH_DB" python3 <<'PY'
 import os, json, subprocess, datetime
 hist=os.environ["HIST"]; start=int(os.environ["START"]); db=os.environ["CHDB"]
-rows=[]
+rows=[]; steprows=[]
 for i,line in enumerate(open(hist),1):
     if i<=start: continue
     line=line.strip()
     if not line: continue
     try: r=json.loads(line)
     except Exception: continue
-    sp=r.get("syscall_profile") or {}; g=r.get("gate") or {}
+    sp=r.get("syscall_profile") or {}; g=r.get("gate") or {}; pf=r.get("perf") or {}
+    ts=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"); runid=r.get("runid","")
     rows.append({
-        "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "runid": r.get("runid",""), "arm": r.get("arm",""),
+        "ts": ts, "runid": runid, "arm": r.get("arm",""),
         "config_hash": r.get("config_hash") or "", "parent_hash": "",
         "hypothesis": r.get("notes",""), "score": float(r.get("score",0)),
         "max_sustained_conn_s": int(r.get("max_sustained_conn_s",0)),
@@ -38,18 +38,31 @@ for i,line in enumerate(open(hist),1):
         "sysc_io_uring_enter": sp.get("io_uring_enter",0), "sysc_accept4": sp.get("accept4",0),
         "sysc_read": sp.get("read",0), "sysc_write": sp.get("write",0),
         "sysc_close": sp.get("close",0), "sysc_epoll_wait": sp.get("epoll_wait",0),
-        "perf_ipc":0,"perf_llc_miss_pc":0,"perf_ctxsw_pc":0,
+        "perf_ipc": float(pf.get("ipc",0) or 0), "perf_instr_pc": float(pf.get("instr_pc",0) or 0),
+        "perf_llc_miss_pc":0,"perf_ctxsw_pc":0,
         "kernel":"", "env_fingerprint": r.get("env_fingerprint",""),
         "input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0,
     })
+    # per-step rows (embedded in the HISTORY row) -> steps table
+    for s in (r.get("per_step") or []):
+        steprows.append({
+            "ts": ts, "runid": runid, "step_idx": int(s.get("idx",0)),
+            "offered_cps": int(s.get("offered",0)), "completed_cps": int(float(s.get("completed_cps",0))),
+            "failed_cps": 0, "cpu_util": float(s.get("cpu_util",0)),
+            "max_recvq": int(s.get("max_recvq",0)), "p50_accept_ms": 0.0,
+            "p99_accept_ms": float(s.get("p99_ms",0)), "is_ceiling": 0,
+        })
 if not rows:
     raise SystemExit(0)
-data="\n".join(json.dumps(x) for x in rows)
-p=subprocess.run(["clickhouse-client","--query", f"INSERT INTO {db}.runs FORMAT JSONEachRow"],
-                 input=data, text=True, capture_output=True)
-if p.returncode!=0:
-    import sys; sys.stderr.write("[flush-ch] insert failed: "+p.stderr[:300]+"\n"); raise SystemExit(1)
-print(len(rows))
+def insert(table, data):
+    if not data: return 0
+    p=subprocess.run(["clickhouse-client","--query", f"INSERT INTO {db}.{table} FORMAT JSONEachRow"],
+                     input="\n".join(json.dumps(x) for x in data), text=True, capture_output=True)
+    if p.returncode!=0:
+        import sys; sys.stderr.write(f"[flush-ch] {table} insert failed: "+p.stderr[:300]+"\n"); raise SystemExit(1)
+    return len(data)
+n=insert("runs", rows); insert("steps", steprows)
+print(n)
 PY
 rc=$?
 if [ "$rc" -eq 0 ]; then echo "$total" > "$HW"; echo "[flush-ch] flushed up to line $total" >&2; fi

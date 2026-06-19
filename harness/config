@@ -11,7 +11,12 @@ CH_CPUS="0-1,12"
 CONTROL_PORT=30
 TREAT_PORT=31
 BIND_ADDR="0.0.0.0"          # arms listen here
-TARGET_HOST="127.0.0.1"      # single-box: loadgen connects over loopback (Track B: box-1 IP)
+# loadgen target + location:
+#   single-box (default): TARGET_HOST=127.0.0.1, LOADGEN_URL="" (loadgen runs locally over loopback)
+#   2-box (Track B):      TARGET_HOST=<box-1 address reachable from box 2>,
+#                         LOADGEN_URL="http://<box-2 ip>:8088"  (harness drives the remote loadgen API)
+TARGET_HOST="${TARGET_HOST:-127.0.0.1}"
+LOADGEN_URL="${LOADGEN_URL:-}"
 
 # REPLY_BYTES — 19 bytes, byte-for-byte. The gate validates this exactly.
 REPLY_BYTES=$'HTTP/1.1 200 OK\r\n\r\n'
@@ -35,7 +40,10 @@ EPSILON=0.01                 # min fractional improvement to promote a new champ
 PATIENCE=30                  # distinct configs without improvement => plateau => STOP
 K=20                         # treatment runs between control-drift watchdog checks
 CTX_ROTATE_TOKENS=120000     # claude -p session input-token threshold to rotate session
-OPT_MODEL="opus"
+# model tiering: cheap Sonnet for routine exploration, periodic Opus for a deeper attempt.
+OPT_MODEL="sonnet"           # default per-iteration model (≈5-10x cheaper than opus)
+DEEP_MODEL="opus"            # used every DEEP_EVERY iterations for a harder/deeper attempt
+DEEP_EVERY=8                 # 0 = never use DEEP_MODEL (pure Sonnet); 8 = Opus every 8th iter
 ITER_TIMEOUT=900             # wall-clock cap per claude -p iteration (seconds)
 
 # --- paths ------------------------------------------------------------------

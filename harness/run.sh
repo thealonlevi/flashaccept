@@ -56,12 +56,28 @@ trap 'stop_arm' EXIT
 cpu_usec(){ awk '/usage_usec/{print $2}' "$SUTCG/cpu.stat" 2>/dev/null; }
 max_recvq(){ ss -ltnH "sport = :$PORT" 2>/dev/null | awk '{if($2>m)m=$2}END{print m+0}'; }
 
+# loadgen_run <rate> <duration> <threads> <sample_pct> -> prints loadgen JSON.
+# Remote (box 2) when LOADGEN_URL is set; else local subprocess (single-box dev). In remote mode
+# TARGET_HOST must be box 1's address as reachable from box 2 (set it in harness/config).
+loadgen_run(){
+  local rate="$1" dur="$2" th="$3" sp="$4"
+  if [ -n "${LOADGEN_URL:-}" ]; then
+    curl -fsS --max-time $((dur+30)) -G "$LOADGEN_URL/run" \
+      --data-urlencode "host=$TARGET_HOST" --data-urlencode "port=$PORT" \
+      --data-urlencode "rate=$rate"        --data-urlencode "duration=$dur" \
+      --data-urlencode "threads=$th"       --data-urlencode "sample_pct=$sp" 2>/dev/null
+  else
+    loadgen/loadgen --host "$TARGET_HOST" --port "$PORT" --rate "$rate" --duration "$dur" \
+      --threads "$th" --sample-pct "$sp"
+  fi
+}
+
 # ---- 2. smoke test --------------------------------------------------------
 smoke(){
   local t0=$SECONDS
   while [ $((SECONDS-t0)) -lt "$SMOKE_TIMEOUT" ]; do
     ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q . && {
-      local out; out=$(loadgen/loadgen --host "$TARGET_HOST" --port "$PORT" --rate 200 --duration 1 --threads 2 --sample-pct 100)
+      local out; out=$(loadgen_run 200 1 2 100)
       echo "$out" | grep -q '"reply_ok":true' && [ "$(echo "$out"|sed 's/.*"completed":\([0-9]*\).*/\1/')" -ge 100 ] && return 0
     }
     sleep 0.5
@@ -76,14 +92,12 @@ run_ramp(){   # echoes: <max_sustained_conn_s> <ceiling_reason> ; writes per-ste
   while read -r RATE; do
     [[ "$RATE" =~ ^[0-9]+$ ]] || continue
     # warmup
-    loadgen/loadgen --host "$TARGET_HOST" --port "$PORT" --rate "$RATE" --duration "$WARMUP" \
-       --threads "${LG_THREADS:-8}" --sample-pct "$SAMPLE_PCT" >/dev/null 2>&1
+    loadgen_run "$RATE" "$WARMUP" "${LG_THREADS:-8}" "$SAMPLE_PCT" >/dev/null 2>&1
     # measure (sample cpu + recvq around it)
     local u0 u1 wall mq res
     u0=$(cpu_usec); local s0=$SECONDS
     mq=$( ( for i in $(seq 1 "$MEASURE"); do max_recvq; sleep 1; done ) | sort -n | tail -1 )
-    res=$(loadgen/loadgen --host "$TARGET_HOST" --port "$PORT" --rate "$RATE" --duration "$MEASURE" \
-       --threads "${LG_THREADS:-8}" --sample-pct "$SAMPLE_PCT")
+    res=$(loadgen_run "$RATE" "$MEASURE" "${LG_THREADS:-8}" "$SAMPLE_PCT")
     u1=$(cpu_usec); wall=$(( (SECONDS-s0>0?SECONDS-s0:1) ))
     local comp drop ok p99
     comp=$(echo "$res" | sed 's/.*"completed_cps":\([0-9.]*\).*/\1/')
@@ -116,7 +130,7 @@ profile_syscalls(){   # writes $1 with per-conn counts
   command -v strace >/dev/null || { echo '{}' > "$out"; return; }
   ( strace -f -c -p "$ARM_PID" -o "$RUNDIR/strace.txt" 2>/dev/null ) &
   local sp=$!
-  local res; res=$(loadgen/loadgen --host "$TARGET_HOST" --port "$PORT" --rate "$rate" --duration 3 --threads 4 --sample-pct 0)
+  local res; res=$(loadgen_run "$rate" 3 4 0)
   kill -INT "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
   local comp; comp=$(echo "$res" | sed 's/.*"completed":\([0-9]*\).*/\1/'); [ "${comp:-0}" -lt 1 ] && comp=1
   awk -v C="$comp" '
@@ -126,14 +140,38 @@ profile_syscalls(){   # writes $1 with per-conn counts
     "$RUNDIR/strace.txt" > "$out" 2>/dev/null || echo '{}' > "$out"
 }
 
+# perf pass: IPC + instructions-per-connection. instr/conn is FREQUENCY-INDEPENDENT, so it's a
+# far less noisy efficiency signal than conn/s on a VM whose clock wanders. (LLC misses aren't
+# exposed by this VM's PMU.) Best-effort, not gated.
+perf_pass(){   # writes {"ipc":..,"instr_pc":..} to $1
+  local out="$1"
+  command -v perf >/dev/null || { echo '{}' > "$out"; return; }
+  perf stat -e instructions,cycles -p "$ARM_PID" -o "$RUNDIR/perf.txt" -- sleep 3 2>/dev/null &
+  local pp=$!
+  local res; res=$(loadgen_run 5000 3 4 0)
+  wait "$pp" 2>/dev/null
+  local comp; comp=$(echo "$res" | sed 's/.*"completed":\([0-9]*\).*/\1/'); [ "${comp:-0}" -lt 1 ] && comp=1
+  RUNDIR="$RUNDIR" COMP="$comp" OUT="$out" python3 <<'PY'
+import os,re
+e=os.environ
+try: txt=open(os.path.join(e["RUNDIR"],"perf.txt")).read()
+except Exception: txt=""
+def num(p):
+    m=re.search(r'([\d,]+)\s+'+p, txt); return int(m.group(1).replace(',','')) if m else 0
+ins=num('instructions'); cyc=num('cycles'); comp=int(e["COMP"])
+open(e["OUT"],"w").write('{"ipc":%.3f,"instr_pc":%.0f}'%((ins/cyc if cyc else 0),(ins/comp if comp else 0)))
+PY
+}
+
 # ---- 5. record ------------------------------------------------------------
 # reads per-step / syscall JSON from files (robust — never pass big JSON via argv)
-record_score(){   # score max_sustained reason  [stepfile] [syscfile]
-  local score="$1" mx="$2" reason="$3" stepfile="${4:-}" syscfile="${5:-}"
+record_score(){   # score max_sustained reason [stepfile] [syscfile] [perffile] [spread]
+  local score="$1" mx="$2" reason="$3" stepfile="${4:-}" syscfile="${5:-}" perffile="${6:-}" spread="${7:-0}"
   CFG_HASH=""
   [ "$ARM" = treatment ] && CFG_HASH="$(git rev-parse HEAD 2>/dev/null || echo '')"
-  RUNID="$RUNID" ARM="$ARM" SCORE="$score" MX="$mx" CORES="$CORES" REASON="$reason" \
-  ENVFP="$ENVFP" STEPFILE="$stepfile" SYSCFILE="$syscfile" HIST="$HISTORY" CFG_HASH="$CFG_HASH" \
+  RUNID="$RUNID" ARM="$ARM" SCORE="$score" MX="$mx" CORES="$CORES" REASON="$reason" SPREAD="$spread" \
+  ENVFP="$ENVFP" STEPFILE="$stepfile" SYSCFILE="$syscfile" PERFFILE="$perffile" NREPS="${N:-1}" \
+  HIST="$HISTORY" CFG_HASH="$CFG_HASH" \
   python3 <<'PY'
 import os,json
 def loadsteps(p):
@@ -147,7 +185,9 @@ e=os.environ
 row=dict(runid=e["RUNID"],arm=e["ARM"],config_hash=e["CFG_HASH"] or None,
          score=float(e["SCORE"]),max_sustained_conn_s=int(float(e["MX"])),cores=int(e["CORES"]),
          ceiling_reason=e["REASON"],env_fingerprint=e["ENVFP"],
-         per_step=loadsteps(e["STEPFILE"]),syscall_profile=loadjson(e["SYSCFILE"]))
+         spread_pct=float(e["SPREAD"]),median_of=int(e["NREPS"]),
+         per_step=loadsteps(e["STEPFILE"]),syscall_profile=loadjson(e["SYSCFILE"]),
+         perf=loadjson(e["PERFFILE"]))
 open(e["HIST"],"a").write(json.dumps(row)+"\n")
 print(json.dumps(row))
 PY
@@ -169,7 +209,7 @@ for rep in $(seq 1 "$N"); do
   log "rep $rep/$N ramping…"
   read -r mx REASON < <(run_ramp "$RUNDIR/steps.$rep.jsonl")
   SCORES+=( "$mx" )
-  if [ "$rep" -eq 1 ]; then profile_syscalls "$RUNDIR/syscall.json"; fi
+  if [ "$rep" -eq 1 ]; then profile_syscalls "$RUNDIR/syscall.json"; perf_pass "$RUNDIR/perf.json"; fi
   stop_arm; sleep "$SETTLE"; sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 done
 # median of reps
@@ -177,4 +217,4 @@ MEDIAN=$(printf '%s\n' "${SCORES[@]}" | sort -n | awk '{a[NR]=$1}END{print (NR%2
 SCORE=$(awk -v m="$MEDIAN" -v c="$CORES" 'BEGIN{printf "%.2f", m/c}')
 SPREAD=$(printf '%s\n' "${SCORES[@]}" | sort -n | awk '{a[NR]=$1}END{if(a[1]>0)printf "%.1f",(a[NR]-a[1])/a[1]*100; else print 0}')
 log "reps=${SCORES[*]} median_conn_s=$MEDIAN score=$SCORE spread=${SPREAD}% ceiling=$REASON"
-record_score "$SCORE" "$MEDIAN" "$REASON" "$RUNDIR/steps.1.jsonl" "$RUNDIR/syscall.json"
+record_score "$SCORE" "$MEDIAN" "$REASON" "$RUNDIR/steps.1.jsonl" "$RUNDIR/syscall.json" "$RUNDIR/perf.json" "$SPREAD"
