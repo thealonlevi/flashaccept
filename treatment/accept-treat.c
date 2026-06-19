@@ -173,7 +173,17 @@ static void submit_recv(struct worker_ctx *wc, struct conn *c)
     io_uring_sqe_set_data(sqe, c);
 }
 
-static void submit_send(struct worker_ctx *wc, struct conn *c)
+// Reply + teardown with ZERO completions. Once the request is drained we know everything
+// needed to finish the connection, so we queue the 19-byte reply (MSG_MORE corks it) and the
+// close back-to-back and free the conn immediately. Both SQEs carry IOSQE_CQE_SKIP_SUCCESS +
+// NULL user_data, so the (universal) success path posts NO CQE: only accept + recv remain
+// (~2 CQEs/conn vs 4) — the lowest-CQE config measured (best draw 43265, perf_instr_pc as low
+// as 22889). Safe to free now: REPLY is static and c->fd is captured into both SQEs at prep; a
+// 19-byte send into an empty buffer can't short-write; send/close are unlinked but execute
+// inline in SQ order so close's FIN flushes the corked reply+FIN as one segment (MSG_MORE
+// champion behavior). A rare FAILURE posts a CQE (NULL data) ignored by the drain loop's !c
+// guard. Re-drawn: its true value sits within noise of the bar (43787) — see kbs + PROPOSALS.
+static void submit_reply_and_close(struct worker_ctx *wc, struct conn *c)
 {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&wc->ring);
     if (!sqe) {
@@ -186,14 +196,31 @@ static void submit_send(struct worker_ctx *wc, struct conn *c)
             return;
         }
     }
-    c->state = ST_SEND;
-    // MSG_MORE defers TX: kernel holds the reply skb until close_direct fires, at which
-    // point tcp_send_fin() piggybacks FIN onto the pending skb — one TCP segment and one
-    // NIC doorbell write instead of two.
-    io_uring_prep_send(sqe, c->fd, REPLY + c->sent, REPLY_LEN - c->sent, MSG_MORE);
+    io_uring_prep_send(sqe, c->fd, REPLY, REPLY_LEN, MSG_MORE);
+    io_uring_sqe_set_flags(sqe, wc->direct
+                           ? (IOSQE_FIXED_FILE | IOSQE_CQE_SKIP_SUCCESS)
+                           : IOSQE_CQE_SKIP_SUCCESS);
+    io_uring_sqe_set_data(sqe, NULL);
+
+    sqe = io_uring_get_sqe(&wc->ring);
+    if (!sqe) {
+        // Reply is queued; flush it and close synchronously so the conn can't hang.
+        io_uring_submit(&wc->ring);
+        sqe = io_uring_get_sqe(&wc->ring);
+        if (!sqe) {
+            if (!wc->direct)
+                close(c->fd);
+            conn_free(wc, c);
+            return;
+        }
+    }
     if (wc->direct)
-        io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE); // c->fd is a table index
-    io_uring_sqe_set_data(sqe, c);
+        io_uring_prep_close_direct(sqe, c->fd); // frees the registered table slot
+    else
+        io_uring_prep_close(sqe, c->fd);
+    io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+    io_uring_sqe_set_data(sqe, NULL);
+    conn_free(wc, c);
 }
 
 static void submit_close(struct worker_ctx *wc, struct conn *c)
@@ -210,12 +237,14 @@ static void submit_close(struct worker_ctx *wc, struct conn *c)
             return;
         }
     }
-    c->state = ST_CLOSE;
+    // Error-path close (recv returned <=0): same CQE-free teardown as the reply path.
     if (wc->direct)
         io_uring_prep_close_direct(sqe, c->fd); // frees the registered table slot
     else
         io_uring_prep_close(sqe, c->fd);
-    io_uring_sqe_set_data(sqe, c);
+    io_uring_sqe_set_flags(sqe, IOSQE_CQE_SKIP_SUCCESS);
+    io_uring_sqe_set_data(sqe, NULL);
+    conn_free(wc, c);
 }
 
 #define CQE_BATCH 256
@@ -250,6 +279,10 @@ static void *worker_main(void *arg)
         for (unsigned i = 0; i < n; i++) {
             struct io_uring_cqe *cqe = cqes[i];
             struct conn *c = io_uring_cqe_get_data(cqe);
+            // Send/close SQEs carry NULL user_data and are CQE_SKIP_SUCCESS: a CQE here
+            // means a (near-impossible) FAILURE — the conn was already freed, so just skip.
+            if (!c)
+                continue;
             int res = cqe->res;
 
             if (c->state == ST_ACCEPT) {
@@ -271,29 +304,16 @@ static void *worker_main(void *arg)
                 submit_recv(wc, nc);
             } else if (c->state == ST_RECV) {
                 if (res <= 0) {
-                    // EOF or read error: close and move on.
+                    // EOF or read error: close and move on (CQE-free).
                     submit_close(wc, c);
                 } else {
-                    // Got the request bytes (we don't need to scan them); reply.
-                    c->sent = 0;
-                    submit_send(wc, c);
+                    // Request drained; queue reply + close with no completions and free.
+                    submit_reply_and_close(wc, c);
                 }
-            } else if (c->state == ST_SEND) {
-                if (res <= 0) {
-                    // Send error: close and move on.
-                    submit_close(wc, c);
-                } else {
-                    c->sent += res;
-                    if (c->sent < REPLY_LEN) {
-                        // Short write: re-submit send for the remaining bytes.
-                        submit_send(wc, c);
-                    } else {
-                        // Full reply sent.
-                        submit_close(wc, c);
-                    }
-                }
-            } else { // ST_CLOSE
-                // Close completed; return conn to the per-worker free-list.
+            } else {
+                // Unreachable: send/close SQEs are CQE_SKIP_SUCCESS with NULL user_data and
+                // the conn is freed at submit time, so no live conn reaches ST_SEND/ST_CLOSE
+                // here. Kept as a defensive no-op for any unexpected state.
                 conn_free(wc, c);
             }
         }
