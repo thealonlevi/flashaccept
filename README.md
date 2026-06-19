@@ -81,8 +81,9 @@ cc myserver.c $(pkg-config --cflags --libs flashaccept) -o myserver
 `libflashaccept.so.1`), and a `flashaccept.pc` for pkg-config. Override `PREFIX`/`DESTDIR` for
 packaging (`make install PREFIX=/usr DESTDIR=pkgroot`).
 
-Requires Linux with io_uring (kernel ≥ 5.x; multishot accept uses ≥ 5.19, with graceful fallback)
-and liburing. Full reference: [docs/API.md](docs/API.md).
+Requires Linux + **liburing ≥ 2.3** (Ubuntu 24.04+, or [build liburing from
+source](https://github.com/axboe/liburing)). The fast path uses kernel ≥ 5.19 (multishot accept);
+older kernels fall back to single-shot accept at runtime. Full reference: [docs/API.md](docs/API.md).
 
 ## Scope & limitations
 

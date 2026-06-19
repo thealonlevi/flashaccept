@@ -69,6 +69,15 @@
 #include <sys/resource.h>
 #include <liburing.h>
 
+/* flashaccept's fast path uses multishot accept, direct descriptors, and
+ * SINGLE_ISSUER/DEFER_TASKRUN — all liburing >= 2.3 (Ubuntu 24.04+, or build
+ * liburing from source). Fail with a clear message instead of a cryptic
+ * "IORING_FILE_INDEX_ALLOC undeclared" on older liburing (e.g. Ubuntu 22.04's 2.1). */
+#if !defined(IO_URING_VERSION_MAJOR) || (IO_URING_VERSION_MAJOR < 2) || \
+    (IO_URING_VERSION_MAJOR == 2 && IO_URING_VERSION_MINOR < 3)
+#error "flashaccept requires liburing >= 2.3. Upgrade liburing-dev, or build it from source: https://github.com/axboe/liburing"
+#endif
+
 #define FA_VERSION_STR "1.0.0"
 
 /* Tunables that are not worth exposing in the public API. */
