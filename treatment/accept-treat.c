@@ -180,7 +180,10 @@ static void submit_send(struct worker_ctx *wc, struct conn *c)
         }
     }
     c->state = ST_SEND;
-    io_uring_prep_send(sqe, c->fd, REPLY + c->sent, REPLY_LEN - c->sent, 0);
+    // MSG_MORE defers TX: kernel holds the reply skb until close_direct fires, at which
+    // point tcp_send_fin() piggybacks FIN onto the pending skb — one TCP segment and one
+    // NIC doorbell write instead of two.
+    io_uring_prep_send(sqe, c->fd, REPLY + c->sent, REPLY_LEN - c->sent, MSG_MORE);
     if (wc->direct)
         io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE); // c->fd is a table index
     io_uring_sqe_set_data(sqe, c);
