@@ -4,8 +4,21 @@ to raise its score. **The score is `1e9 / instructions_per_connection`** — i.e
 instructions the accept path spends per accepted connection (higher score = fewer instr/conn =
 less CPU). This is the real goal: replace a Go service ("riptide") whose accept path is CPU-bound
 on `syscall6` at 40k conn/s, with an io_uring path that accepts each connection for less CPU.
-`instr/conn` is measured by perf at the load ceiling, averaged over 5 reps (clean, frequency-
+`instr/conn` is measured by perf at a fixed concurrency, averaged over 5 reps (clean, frequency-
 independent). conn/s and conn/core-second are also recorded. Higher score is better.
+
+## Work fast and well — use parallel subagents (token budget is NOT a concern)
+Prioritize SPEED and QUALITY over tokens. You have the Task tool — **spawn several subagents IN
+PARALLEL** (one message, multiple Task calls) instead of investigating serially. A good split:
+- one digs the ClickHouse data + `acceptbench.profile`/syscall profile to pinpoint where the
+  instructions go this iteration (and what past mutations already tried — don't repeat them);
+- one studies the current `treatment/` code for the specific hot path;
+- one or two research/evaluate concrete io_uring techniques for cutting per-connection work
+  (multishot accept, SQE-linking accept→recv→send→close, registered files/direct descriptors,
+  ring-mapped/registered buffers, fixed reply buffer, batched submit/harvest, provide-buffers).
+Then SYNTHESIZE their findings and implement the single most promising change. Parallel breadth is
+encouraged; just converge to **one** coherent code change per iteration so the measurement is
+attributable. Don't re-explore what `git log` / kbs / ClickHouse show was already tried.
 
 ## Hard rules (violating these wastes an iteration)
 - You may edit **only files under `treatment/`**. Never touch `harness/`, `control/`, `loadgen/`,

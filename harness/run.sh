@@ -291,20 +291,24 @@ fi
 ENVFP="$(env_fingerprint)"
 log "built $BIN ; env=$ENVFP ; runid=$RUNID"
 # OBJECTIVE = minimize CPU work per accepted connection. SCORE = 1e9 / instr_per_conn (higher is
-# better, so the keep/revert logic is unchanged). instr_per_conn = CPU instructions per connection
-# (perf exact counter): clean even at low CPU, frequency-independent, directly riptide's question.
-# Measured at each rep's adaptive ceiling, averaged over N reps. conn/s + conn/core-sec recorded too.
+# better). instr_per_conn = CPU instructions per connection (perf exact counter): frequency-
+# independent, directly riptide's question. ROBUSTNESS: measured at a FIXED concurrency
+# (MEASURE_CONNS) every rep — not the variable adaptive ceiling — so the operating point is
+# identical across reps and iterations, which collapses the run-to-run spread. Averaged over N reps.
 declare -a CONNS=() CPUS=() INSTR=()
-REASON="none"
+REASON="fixed@${MEASURE_CONNS}conns"
+CEIL_CONNS="${MEASURE_CONNS:-512}"   # perf/profile passes load at this same fixed concurrency
 for rep in $(seq 1 "$N"); do
   start_arm
   if ! smoke; then log "SMOKE FAILED (rep $rep) — score 0"; stop_arm; record_score 0 0 smoke_fail >/dev/null; echo '{"score":0,"reason":"smoke_fail"}'; exit 0; fi
-  log "rep $rep/$N ramping…"
-  read -r mx REASON bcpu < <(run_ramp "$RUNDIR/steps.$rep.jsonl" "$([ "$rep" -eq 1 ] && echo 1 || echo 0)")
-  perf_pass "$RUNDIR/perf.$rep.json"   # instr/conn at this rep's ceiling concurrency
+  STEPFILE="$RUNDIR/steps.$rep.jsonl"; : > "$STEPFILE"
+  log "rep $rep/$N: measuring at fixed ${MEASURE_CONNS} in-flight…"
+  measure_step conns "${MEASURE_CONNS:-512}" 0 "$([ "$rep" -eq 1 ] && echo 1 || echo 0)"   # sets M_COMP/M_CPU/M_GATE
+  perf_pass "$RUNDIR/perf.$rep.json"   # instr/conn at the SAME fixed concurrency
   ipc=$(python3 -c "import json;print(json.load(open('$RUNDIR/perf.$rep.json')).get('instr_pc',0))" 2>/dev/null || echo 0)
-  CONNS+=( "${mx:-0}" ); CPUS+=( "${bcpu:-0}" ); INSTR+=( "${ipc:-0}" )
-  log "  rep $rep: conn_s=${mx:-0} cpu@ceiling=${bcpu:-0} instr/conn=${ipc:-0}"
+  if [ "$M_GATE" -eq 0 ]; then mx=0; ipc=0; REASON="gate_fail@${MEASURE_CONNS}"; else mx="$M_COMP"; fi
+  CONNS+=( "${mx:-0}" ); CPUS+=( "${M_CPU:-0}" ); INSTR+=( "${ipc:-0}" )
+  log "  rep $rep: conn_s=${mx:-0} cpu=${M_CPU:-0} instr/conn=${ipc:-0} gate=$M_GATE"
   if [ "$rep" -eq 1 ]; then profile_syscalls "$RUNDIR/syscall.json"; cp "$RUNDIR/perf.$rep.json" "$RUNDIR/perf.json"; profile_functions "$RUNDIR/funcprof.json"; fi
   stop_arm; sleep "$SETTLE"; sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 done

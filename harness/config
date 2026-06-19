@@ -37,6 +37,7 @@ CONN_START=32                # first in-flight connection count
 CONN_GROWTH=2                # double in-flight each step
 CONN_MAX=200000              # safety cap on in-flight connections
 PLATEAU_GAIN=0.03            # stop if completed grows <3% despite more concurrency (SUT is the limit)
+MEASURE_CONNS=512             # FIXED in-flight conns for the scored measurement (consistent instr/conn => low noise)
 WARMUP=10                    # seconds per step before measuring
 MEASURE=30                   # seconds measured per step
 SETTLE=3                     # quiet delay between runs (+ drop_caches)
@@ -45,15 +46,15 @@ N=5                          # load tests per scored config; score = MEAN of rep
 SMOKE_TIMEOUT=20             # arm must pass a 100-conn smoke test within this many seconds
 
 # --- optimizer loop knobs ---------------------------------------------------
-EPSILON=0.01                 # min fractional improvement to promote a new champion
+EPSILON=0.03                 # promote only if >3% better — above the measurement noise floor
 PATIENCE=30                  # distinct configs without improvement => plateau => STOP
 K=20                         # treatment runs between control-drift watchdog checks
 CTX_ROTATE_TOKENS=120000     # claude -p session input-token threshold to rotate session
-# model tiering: cheap Sonnet for routine exploration, periodic Opus for a deeper attempt.
-OPT_MODEL="sonnet"           # default per-iteration model (≈5-10x cheaper than opus)
-DEEP_MODEL="opus"            # used every DEEP_EVERY iterations for a harder/deeper attempt
-DEEP_EVERY=8                 # 0 = never use DEEP_MODEL (pure Sonnet); 8 = Opus every 8th iter
-ITER_TIMEOUT=900             # wall-clock cap per claude -p iteration (seconds)
+# quality over budget: Opus every iteration, deep parallel-subagent exploration (token cost N/A).
+OPT_MODEL="opus"
+DEEP_MODEL="opus"
+DEEP_EVERY=0                 # 0 = always OPT_MODEL (no cheap tier)
+ITER_TIMEOUT=2400            # 40 min: allow deep parallel-subagent exploration to finish
 
 # --- paths ------------------------------------------------------------------
 RESULTS_DIR="results"
