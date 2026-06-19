@@ -14,6 +14,7 @@ SOVER    := 1
 CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra
 CFLAGS  += -Iinclude -fPIC
+LDFLAGS ?=                       # e.g. LDFLAGS=-L/opt/liburing/lib to link a custom liburing
 LDLIBS  := -luring -lpthread
 
 PREFIX  ?= /usr/local
@@ -42,7 +43,7 @@ $(STATIC): $(OBJ)
 # Shared library with a proper SONAME, plus the usual dev/runtime symlinks:
 #   libflashaccept.so -> libflashaccept.so.1 -> libflashaccept.so.1.0.0
 $(SHARED): $(OBJ)
-	$(CC) -shared -Wl,-soname,$(SONAME) -o $(SHARED_V) $^ $(LDLIBS)
+	$(CC) -shared -Wl,-soname,$(SONAME) -o $(SHARED_V) $^ $(LDFLAGS) $(LDLIBS)
 	ln -sf $(SHARED_V) $(SONAME)
 	ln -sf $(SONAME) $(SHARED)
 
@@ -51,7 +52,7 @@ $(SHARED): $(OBJ)
 
 examples: $(EXAMPLES)
 examples/echo_server: examples/echo_server.c $(STATIC)
-	$(CC) $(CFLAGS) -o $@ examples/echo_server.c $(STATIC) $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ examples/echo_server.c $(STATIC) $(LDLIBS)
 
 # pkg-config file (generated so prefix/version stay in sync).
 flashaccept.pc:

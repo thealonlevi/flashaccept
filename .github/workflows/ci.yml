@@ -13,18 +13,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install deps (ensure liburing >= 2.3)
+      - name: Install deps (ensure liburing >= 2.3, header+lib consistent)
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config git
-          sudo apt-get install -y liburing-dev || true
+          sudo apt-get install -y build-essential pkg-config git liburing-dev
           if ! pkg-config --atleast-version=2.3 liburing 2>/dev/null; then
-            echo "system liburing too old ($(pkg-config --modversion liburing 2>/dev/null || echo none)); building from source"
+            echo "apt liburing $(pkg-config --modversion liburing 2>/dev/null || echo none) too old; removing and building 2.6 from source"
+            sudo apt-get remove -y liburing-dev liburing2 || true   # avoid header(new)/lib(old) mismatch
             git clone --depth 1 --branch liburing-2.6 https://github.com/axboe/liburing /tmp/liburing
-            ( cd /tmp/liburing && ./configure && make -j"$(nproc)" && sudo make install )
+            ( cd /tmp/liburing && ./configure --prefix=/usr && make -j"$(nproc)" && sudo make install )
             sudo ldconfig
           fi
-          echo "liburing $(pkg-config --modversion liburing)"
+          echo "using liburing $(pkg-config --modversion liburing)"
       - name: Build library
         run: make
       - name: Build examples
@@ -67,14 +67,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install deps (ensure liburing >= 2.3)
+      - name: Install deps (ensure liburing >= 2.3, header+lib consistent)
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config git
-          sudo apt-get install -y liburing-dev || true
+          sudo apt-get install -y build-essential pkg-config git liburing-dev
           if ! pkg-config --atleast-version=2.3 liburing 2>/dev/null; then
+            sudo apt-get remove -y liburing-dev liburing2 || true
             git clone --depth 1 --branch liburing-2.6 https://github.com/axboe/liburing /tmp/liburing
-            ( cd /tmp/liburing && ./configure && make -j"$(nproc)" && sudo make install )
+            ( cd /tmp/liburing && ./configure --prefix=/usr && make -j"$(nproc)" && sudo make install )
             sudo ldconfig
           fi
       - name: Build with AddressSanitizer + UBSan
