@@ -10,3 +10,4 @@ Format: - [slug](slug.md) — one-line takeaway (hypothesis → measured effect 
 - [defer-taskrun-single-issuer](defer-taskrun-single-issuer.md) — SINGLE_ISSUER|DEFER_TASKRUN → WON 29292→36079. CHAMPION. Lever is kernel CPU/op.
 - [exploit-best-arm](exploit-best-arm.md) — 16 iters, exploration exhausted: per-conn syscalls already minimal (~2.5 enter, 0 read/write). direct-desc@4096 = best arm (champion-level, draws 36136/36048/27217; only one to exceed champion). ~30% noise PROVEN; harness/EPSILON is the constraint, not code. See results/PROPOSALS.md.
 - [liburing-older-than-kernel](liburing-older-than-kernel.md) — NO_SQARRAY won't build (liburing headers older than 6.8 kernel); grep liburing headers before proposing new flags/ops.
+- [conn-freelist-on-direct-champion](conn-freelist-on-direct-champion.md) — iter20: free-list re-applied under new 1e9/instr_conn formula; new harness shows libc_pct=1.32% → 0.92% savings (~0.4% instr/conn reduction expected)

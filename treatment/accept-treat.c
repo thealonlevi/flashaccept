@@ -54,6 +54,7 @@ enum conn_state {
 };
 
 struct conn {
+    struct conn *next;         // free-list link (only valid when conn is on the free list)
     enum conn_state state;
     int fd;                    // direct-descriptor INDEX when wc->direct, else a real fd
     int sent;                  // bytes of REPLY already sent (for short-write handling)
@@ -67,7 +68,24 @@ struct worker_ctx {
     int listen_fd;
     int direct;                // 1 if the registered file table is active (direct descriptors)
     struct conn accept_marker; // state == ST_ACCEPT
+    struct conn *free_head;    // per-worker conn free-list (single-threaded, no lock needed)
 };
+
+static struct conn *conn_alloc(struct worker_ctx *wc)
+{
+    if (wc->free_head) {
+        struct conn *c = wc->free_head;
+        wc->free_head = c->next;
+        return c;
+    }
+    return malloc(sizeof(struct conn));
+}
+
+static void conn_free(struct worker_ctx *wc, struct conn *c)
+{
+    c->next = wc->free_head;
+    wc->free_head = c;
+}
 
 static int make_listen_socket(int port)
 {
@@ -137,7 +155,7 @@ static void submit_recv(struct worker_ctx *wc, struct conn *c)
             // effectively-unreachable deep-queue exhaustion path.)
             if (!wc->direct)
                 close(c->fd);
-            free(c);
+            conn_free(wc, c);
             return;
         }
     }
@@ -157,7 +175,7 @@ static void submit_send(struct worker_ctx *wc, struct conn *c)
         if (!sqe) {
             if (!wc->direct)
                 close(c->fd);
-            free(c);
+            conn_free(wc, c);
             return;
         }
     }
@@ -178,7 +196,7 @@ static void submit_close(struct worker_ctx *wc, struct conn *c)
             // Fall back to a synchronous close so we never leak the fd.
             if (!wc->direct)
                 close(c->fd);
-            free(c);
+            conn_free(wc, c);
             return;
         }
     }
@@ -196,6 +214,12 @@ static void *worker_main(void *arg)
 {
     struct worker_ctx *wc = arg;
     struct io_uring_cqe *cqes[CQE_BATCH];
+
+    // Pre-populate the per-worker free-list so hot-path accepts never hit glibc malloc.
+    for (int i = 0; i < 128; i++) {
+        struct conn *c = malloc(sizeof(struct conn));
+        if (c) conn_free(wc, c);
+    }
 
     arm_accept(wc);
 
@@ -224,7 +248,7 @@ static void *worker_main(void *arg)
                 if (res < 0)
                     continue; // transient accept error; keep going.
                 // New connection accepted; res is the client fd (direct: table index).
-                struct conn *nc = calloc(1, sizeof *nc);
+                struct conn *nc = conn_alloc(wc);
                 if (!nc) {
                     if (!wc->direct)
                         close(res); // direct slot leaks only on OOM (box is already dying)
@@ -257,8 +281,8 @@ static void *worker_main(void *arg)
                     }
                 }
             } else { // ST_CLOSE
-                // Close completed (ignore res); free per-connection state.
-                free(c);
+                // Close completed; return conn to the per-worker free-list.
+                conn_free(wc, c);
             }
         }
 
