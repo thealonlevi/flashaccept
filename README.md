@@ -96,6 +96,10 @@ Go baseline it was measured against, the metrics, and the AI optimization loop) 
 Created by **Alon Levi**, Co-Founder of **FlashProxy**. Born out of making FlashProxy's
 connection-accept path cheaper at scale.
 
+https://flashproxy.com/
+https://www.linkedin.com/in/thealonlevi/
+
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
