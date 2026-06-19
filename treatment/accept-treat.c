@@ -258,6 +258,25 @@ static void *thread_entry(void *arg)
         CPU_SET(ta->cpu, &set);
         pthread_setaffinity_np(pthread_self(), sizeof set, &set);
     }
+
+    // Initialize the ring in the SAME thread that submits/reaps it so the
+    // SINGLE_ISSUER contract holds. SINGLE_ISSUER + DEFER_TASKRUN move completion
+    // task-work into our io_uring_submit_and_wait GETEVENTS enter and drop the
+    // cross-CPU IPI/eager-wakeup overhead, cutting kernel CPU per completion
+    // without touching the data path. Fall back to a plain ring if the kernel
+    // rejects the flags, so the server always comes up.
+    struct io_uring_params p;
+    memset(&p, 0, sizeof p);
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+    int ret = io_uring_queue_init_params(QUEUE_DEPTH, &ta->wc.ring, &p);
+    if (ret < 0) {
+        ret = io_uring_queue_init(QUEUE_DEPTH, &ta->wc.ring, 0);
+        if (ret < 0) {
+            fprintf(stderr, "io_uring_queue_init: %s\n", strerror(-ret));
+            return NULL;
+        }
+    }
+
     return worker_main(&ta->wc);
 }
 
@@ -311,12 +330,8 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        int ret = io_uring_queue_init(QUEUE_DEPTH, &ta->wc.ring, 0);
-        if (ret < 0) {
-            fprintf(stderr, "io_uring_queue_init: %s\n", strerror(-ret));
-            return 1;
-        }
-
+        // Ring init happens inside thread_entry (the submitting thread) to satisfy
+        // IORING_SETUP_SINGLE_ISSUER.
         if (pthread_create(&threads[i], NULL, thread_entry, ta) != 0) {
             perror("pthread_create");
             return 1;
