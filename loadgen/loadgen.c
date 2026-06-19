@@ -206,12 +206,14 @@ int main(int argc,char**argv){
         for(int r=0;r<F_NREASONS;r++){ failed[r]+=ws[i].failed[r]; failed_total+=ws[i].failed[r]; }
         for(int b=0;b<=HBUCKETS;b++) hist[b]+=ws[i].hist[b];
     }
-    // percentiles
-    uint64_t tot=completed; double p50us=0,p99us=0;
-    if(tot>0){ uint64_t c=0; int p50set=0;
+    // percentiles + tail (p99.9, max)
+    uint64_t tot=completed; double p50us=0,p99us=0,p999us=0,maxus=0;
+    if(tot>0){ uint64_t c=0; int p50set=0,p99set=0,p999set=0;
+        for(int b=0;b<=HBUCKETS;b++) if(hist[b]>0) maxus=b*HUS_PER;   // highest non-empty bucket
         for(int b=0;b<=HBUCKETS;b++){ c+=hist[b];
-            if(!p50set && c>=tot*0.50){ p50us=b*HUS_PER; p50set=1; }
-            if(c>=tot*0.99){ p99us=b*HUS_PER; break; } } }
+            if(!p50set  && c>=tot*0.50 ){ p50us =b*HUS_PER; p50set=1;  }
+            if(!p99set  && c>=tot*0.99 ){ p99us =b*HUS_PER; p99set=1;  }
+            if(!p999set && c>=tot*0.999){ p999us=b*HUS_PER; p999set=1; break; } } }
     double drop = offered? (double)failed_total/offered : 0.0;
     double off_cps = dur>0? offered/dur:0, comp_cps = dur>0? completed/dur:0, fail_cps = dur>0? failed_total/dur:0;
     int reply_ok = (sbad==0);
@@ -221,7 +223,7 @@ int main(int argc,char**argv){
     printf("\"offered_cps\":%.1f,\"completed_cps\":%.1f,\"failed_cps\":%.1f,",off_cps,comp_cps,fail_cps);
     printf("\"drop_rate\":%.6f,\"reply_ok\":%s,",drop,reply_ok?"true":"false");
     printf("\"sampled\":%lu,\"sampled_bad\":%lu,",stot,sbad);
-    printf("\"p50_ms\":%.3f,\"p99_ms\":%.3f,",p50us/1000.0,p99us/1000.0);
+    printf("\"p50_ms\":%.3f,\"p99_ms\":%.3f,\"p99_9_ms\":%.3f,\"max_ms\":%.3f,",p50us/1000.0,p99us/1000.0,p999us/1000.0,maxus/1000.0);
     printf("\"fail_reasons\":{");
     for(int r=0;r<F_NREASONS;r++) printf("%s\"%s\":%lu",r?",":"",F_NAME[r],failed[r]);
     printf("}}\n");

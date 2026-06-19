@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS acceptbench.runs (
   perf_ipc            Float64,
   perf_instr_pc       Float64,             -- instructions per connection (frequency-independent)
   perf_llc_miss_pc    Float64,
-  perf_ctxsw_pc       Float64,
+  perf_ctxsw_pc       Float64,             -- context-switches per connection
+  perf_migr_pc        Float64,             -- cpu-migrations per connection
   kernel              String,
   env_fingerprint     String,
   input_tokens        UInt64,
@@ -46,6 +47,8 @@ CREATE TABLE IF NOT EXISTS acceptbench.steps (
   max_recvq     UInt32,
   p50_accept_ms Float64,
   p99_accept_ms Float64,
+  p99_9_accept_ms Float64,
+  max_accept_ms Float64,
   is_ceiling    UInt8
 ) ENGINE = MergeTree ORDER BY (runid, step_idx);
 
@@ -75,6 +78,9 @@ CREATE TABLE IF NOT EXISTS acceptbench.iterations (
   cost_usd     Float64,
   cum_cost_usd Float64,
   in_tokens    UInt64,
+  out_tokens   UInt64,
+  cache_read_tokens  UInt64,    -- ~0 across iterations => prompt cache went cold (TTL trap)
+  cache_write_tokens UInt64,
   hypothesis   String
 ) ENGINE = MergeTree ORDER BY (ts);
 

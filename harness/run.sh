@@ -86,28 +86,40 @@ smoke(){
 }
 
 # ---- 3. one ramp -> max sustained conn/s ----------------------------------
-run_ramp(){   # echoes: <max_sustained_conn_s> <ceiling_reason> ; writes per-step json to $1
-  local stepfile="$1"; : > "$stepfile"
+run_ramp(){   # run_ramp <stepfile> <do_sample> -> echoes "<max_sustained_conn_s> <ceiling_reason>"
+  local stepfile="$1" do_sample="${2:-0}"; : > "$stepfile"
   local best=0 reason="none" idx=0
   while read -r RATE; do
     [[ "$RATE" =~ ^[0-9]+$ ]] || continue
     # warmup
     loadgen_run "$RATE" "$WARMUP" "${LG_THREADS:-8}" "$SAMPLE_PCT" >/dev/null 2>&1
-    # measure (sample cpu + recvq around it)
-    local u0 u1 wall mq res
-    u0=$(cpu_usec); local s0=$SECONDS
-    mq=$( ( for i in $(seq 1 "$MEASURE"); do max_recvq; sleep 1; done ) | sort -n | tail -1 )
+    # measure: sample cpu+recvq every 1s CONCURRENTLY with the load (previously sampled before the
+    # load, so recvq always read 0 — fixed). Per-second rows feed acceptbench.samples when do_sample.
+    local u0 u1 wall mq res samp="$RUNDIR/.samp"
+    u0=$(cpu_usec); local s0=$SECONDS; : > "$samp"
+    ( for ((i=1;i<=MEASURE;i++)); do sleep 1; printf '%d %s %s\n' "$i" "$(cpu_usec)" "$(max_recvq)"; done ) > "$samp" &
+    local sp=$!
     res=$(loadgen_run "$RATE" "$MEASURE" "${LG_THREADS:-8}" "$SAMPLE_PCT")
+    wait "$sp" 2>/dev/null
     u1=$(cpu_usec); wall=$(( (SECONDS-s0>0?SECONDS-s0:1) ))
-    local comp drop ok p99
+    mq=$(awk '{print $3}' "$samp" | sort -n | tail -1); mq=${mq:-0}
+    if [ "$do_sample" = 1 ]; then
+      awk -v u0="$u0" -v idx="$idx" -v c="$CORES" 'BEGIN{prev=u0}
+        {util=($2-prev)/(c*1000000); if(util<0)util=0;
+         printf "{\"step_idx\":%d,\"t_offset_s\":%d,\"cpu_util\":%.3f,\"recvq\":%d}\n",idx,$1,util,$3; prev=$2}' \
+        "$samp" >> "$RUNDIR/samples.jsonl"
+    fi
+    local comp drop ok p99 p999 maxms
     comp=$(echo "$res" | sed 's/.*"completed_cps":\([0-9.]*\).*/\1/')
     drop=$(echo "$res" | sed 's/.*"drop_rate":\([0-9.]*\).*/\1/')
     ok=$(echo "$res"   | grep -o '"reply_ok":[a-z]*' | cut -d: -f2)
     p99=$(echo "$res"  | sed 's/.*"p99_ms":\([0-9.]*\).*/\1/')
+    p999=$(echo "$res" | sed 's/.*"p99_9_ms":\([0-9.]*\).*/\1/')
+    maxms=$(echo "$res"| sed 's/.*"max_ms":\([0-9.]*\).*/\1/')
     local cpuutil=0
     [ -n "$u0" ] && [ -n "$u1" ] && cpuutil=$(awk -v d=$((u1-u0)) -v c="$CORES" -v w="$wall" 'BEGIN{printf "%.3f", d/(c*w*1000000)}')
-    printf '{"idx":%d,"offered":%d,"completed_cps":%s,"drop_rate":%s,"reply_ok":"%s","cpu_util":%s,"max_recvq":%s,"p99_ms":%s}\n' \
-      "$idx" "$RATE" "${comp:-0}" "${drop:-1}" "${ok:-false}" "$cpuutil" "${mq:-0}" "${p99:-0}" >> "$stepfile"
+    printf '{"idx":%d,"offered":%d,"completed_cps":%s,"drop_rate":%s,"reply_ok":"%s","cpu_util":%s,"max_recvq":%s,"p99_ms":%s,"p99_9_ms":%s,"max_ms":%s}\n' \
+      "$idx" "$RATE" "${comp:-0}" "${drop:-1}" "${ok:-false}" "$cpuutil" "${mq:-0}" "${p99:-0}" "${p999:-0}" "${maxms:-0}" >> "$stepfile"
     log "step $idx: offered=$RATE completed=${comp:-0}/s drop=${drop} reply_ok=${ok} cpu=${cpuutil} recvq=${mq}"
     # gate
     local gate_ok=1
@@ -146,7 +158,9 @@ profile_syscalls(){   # writes $1 with per-conn counts
 perf_pass(){   # writes {"ipc":..,"instr_pc":..} to $1
   local out="$1"
   command -v perf >/dev/null || { echo '{}' > "$out"; return; }
-  perf stat -e instructions,cycles -p "$ARM_PID" -o "$RUNDIR/perf.txt" -- sleep 3 2>/dev/null &
+  # instructions/cycles (IPC) + context-switches/cpu-migrations (software events; work without PMU)
+  perf stat -e instructions,cycles,context-switches,cpu-migrations -p "$ARM_PID" \
+    -o "$RUNDIR/perf.txt" -- sleep 3 2>/dev/null &
   local pp=$!
   local res; res=$(loadgen_run 5000 3 4 0)
   wait "$pp" 2>/dev/null
@@ -157,9 +171,11 @@ e=os.environ
 try: txt=open(os.path.join(e["RUNDIR"],"perf.txt")).read()
 except Exception: txt=""
 def num(p):
-    m=re.search(r'([\d,]+)\s+'+p, txt); return int(m.group(1).replace(',','')) if m else 0
-ins=num('instructions'); cyc=num('cycles'); comp=int(e["COMP"])
-open(e["OUT"],"w").write('{"ipc":%.3f,"instr_pc":%.0f}'%((ins/cyc if cyc else 0),(ins/comp if comp else 0)))
+    m=re.search(r'([\d,]+)\s+'+re.escape(p), txt); return int(m.group(1).replace(',','')) if m else 0
+ins=num('instructions'); cyc=num('cycles'); cs=num('context-switches'); mg=num('cpu-migrations')
+comp=int(e["COMP"])
+open(e["OUT"],"w").write('{"ipc":%.3f,"instr_pc":%.0f,"ctxsw_pc":%.4f,"migr_pc":%.4f}'%(
+  (ins/cyc if cyc else 0),(ins/comp if comp else 0),(cs/comp if comp else 0),(mg/comp if comp else 0)))
 PY
 }
 
@@ -242,7 +258,7 @@ for rep in $(seq 1 "$N"); do
   start_arm
   if ! smoke; then log "SMOKE FAILED (rep $rep) — score 0"; stop_arm; record_score 0 0 smoke_fail >/dev/null; echo '{"score":0,"reason":"smoke_fail"}'; exit 0; fi
   log "rep $rep/$N ramping…"
-  read -r mx REASON < <(run_ramp "$RUNDIR/steps.$rep.jsonl")
+  read -r mx REASON < <(run_ramp "$RUNDIR/steps.$rep.jsonl" "$([ "$rep" -eq 1 ] && echo 1 || echo 0)")
   SCORES+=( "$mx" )
   if [ "$rep" -eq 1 ]; then profile_syscalls "$RUNDIR/syscall.json"; perf_pass "$RUNDIR/perf.json"; profile_functions "$RUNDIR/funcprof.json"; fi
   stop_arm; sleep "$SETTLE"; sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true

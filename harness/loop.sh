@@ -51,7 +51,8 @@ while [ "$iter" -lt "$MAX_ITERS" ]; do
   # parse session + token usage; rotate session on context pressure
   HYP=$(echo "$out" | python3 -c "import sys,json;print(json.load(sys.stdin).get('result','')[:500])" 2>/dev/null)
   SID=$(echo "$out" | python3 -c "import sys,json;print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
-  intok=$(echo "$out" | python3 -c "import sys,json;u=json.load(sys.stdin).get('usage',{});print(u.get('input_tokens',0))" 2>/dev/null || echo 0)
+  # token economics (incl. prompt-cache fields — cache_read ~0 over time => cache went cold)
+  read -r intok outtok cacher cachew < <(echo "$out" | python3 -c "import sys,json;u=json.load(sys.stdin).get('usage',{});print(u.get('input_tokens',0),u.get('output_tokens',0),u.get('cache_read_input_tokens',0),u.get('cache_creation_input_tokens',0))" 2>/dev/null || echo "0 0 0 0")
   cost=$(echo "$out" | python3 -c "import sys,json;print(json.load(sys.stdin).get('total_cost_usd',0))" 2>/dev/null || echo 0)
   log "claude done: in_tokens=$intok cost=\$$cost hyp=\"${HYP:0:80}\""
   if [ "${intok:-0}" -gt "$CTX_ROTATE_TOKENS" ]; then log "context ${intok} > ${CTX_ROTATE_TOKENS} -> rotating session next iter"; SID=""; fi
@@ -88,14 +89,16 @@ while [ "$iter" -lt "$MAX_ITERS" ]; do
     "$VERDICT" "$ceil" "${cost:-0}" "$CUM_COST" "${intok:-0}" >> "$ITERCSV"
   # economics + hypothesis -> ClickHouse (analytics phase; CH active). Best-effort.
   HYP_J="$HYP" ITER="$iter" MODEL_J="$MODEL" SCORE_J="$score" CHAMP_J="$best" VERD_J="$VERDICT" \
-  CEIL_J="$ceil" COST_J="${cost:-0}" CUM_J="$CUM_COST" TOK_J="${intok:-0}" UTC_J="$utc" \
+  CEIL_J="$ceil" COST_J="${cost:-0}" CUM_J="$CUM_COST" TOK_J="${intok:-0}" OUT_J="${outtok:-0}" \
+  CR_J="${cacher:-0}" CW_J="${cachew:-0}" UTC_J="$utc" \
   python3 - <<'PY' 2>/dev/null || true
 import os,json,subprocess
 e=os.environ
 row={"ts":e["UTC_J"].replace("T"," ").replace("Z",""),"iter":int(e["ITER"]),"runid":"",
      "model":e["MODEL_J"],"score":float(e["SCORE_J"]),"champion":float(e["CHAMP_J"]),
      "verdict":e["VERD_J"],"ceiling":e["CEIL_J"],"cost_usd":float(e["COST_J"]),
-     "cum_cost_usd":float(e["CUM_J"]),"in_tokens":int(e["TOK_J"]),"hypothesis":e["HYP_J"][:500]}
+     "cum_cost_usd":float(e["CUM_J"]),"in_tokens":int(e["TOK_J"]),"out_tokens":int(e["OUT_J"]),
+     "cache_read_tokens":int(e["CR_J"]),"cache_write_tokens":int(e["CW_J"]),"hypothesis":e["HYP_J"][:500]}
 subprocess.run(["clickhouse-client","--query","INSERT INTO acceptbench.iterations FORMAT JSONEachRow"],
                input=json.dumps(row),text=True,timeout=10)
 PY

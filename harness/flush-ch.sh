@@ -14,10 +14,11 @@ total=$(wc -l < "$HISTORY")
 
 # Python opens HISTORY itself (NO stdin pipe — a heredoc on `python3 -` would shadow stdin and
 # silently read zero rows). Args: history-path  start-line(1-based, exclusive)  db.
-HIST="$HISTORY" START="$last" CHDB="$CH_DB" python3 <<'PY'
+HIST="$HISTORY" START="$last" CHDB="$CH_DB" RES="$RESULTS_DIR" python3 <<'PY'
 import os, json, subprocess, datetime
-hist=os.environ["HIST"]; start=int(os.environ["START"]); db=os.environ["CHDB"]
-rows=[]; steprows=[]; profrows=[]
+import os.path
+hist=os.environ["HIST"]; start=int(os.environ["START"]); db=os.environ["CHDB"]; res=os.environ["RES"]
+rows=[]; steprows=[]; profrows=[]; samplerows=[]
 for i,line in enumerate(open(hist),1):
     if i<=start: continue
     line=line.strip()
@@ -42,7 +43,8 @@ for i,line in enumerate(open(hist),1):
         "perf_ipc": float(pf.get("ipc",0) or 0), "perf_instr_pc": float(pf.get("instr_pc",0) or 0),
         "cpu_kernel_pct": float(fp.get("kernel_pct",0) or 0), "cpu_user_pct": float(fp.get("user_pct",0) or 0),
         "cpu_liburing_pct": float(fp.get("liburing_pct",0) or 0),
-        "perf_llc_miss_pc":0,"perf_ctxsw_pc":0,
+        "perf_llc_miss_pc":0,"perf_ctxsw_pc": float(pf.get("ctxsw_pc",0) or 0),
+        "perf_migr_pc": float(pf.get("migr_pc",0) or 0),
         "kernel":"", "env_fingerprint": r.get("env_fingerprint",""),
         "input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0,
     })
@@ -53,7 +55,8 @@ for i,line in enumerate(open(hist),1):
             "offered_cps": int(s.get("offered",0)), "completed_cps": int(float(s.get("completed_cps",0))),
             "failed_cps": 0, "cpu_util": float(s.get("cpu_util",0)),
             "max_recvq": int(s.get("max_recvq",0)), "p50_accept_ms": 0.0,
-            "p99_accept_ms": float(s.get("p99_ms",0)), "is_ceiling": 0,
+            "p99_accept_ms": float(s.get("p99_ms",0)), "p99_9_accept_ms": float(s.get("p99_9_ms",0)),
+            "max_accept_ms": float(s.get("max_ms",0)), "is_ceiling": 0,
         })
     # function-level profile rows -> profile table (top hot symbols)
     for rank,t in enumerate(fp.get("top") or [], 1):
@@ -62,6 +65,17 @@ for i,line in enumerate(open(hist),1):
             "module": t.get("module",""), "category": t.get("cat","other"),
             "self_pct": float(t.get("pct",0)),
         })
+    # per-second samples (written per-run by run.sh) -> samples table
+    sf=os.path.join(res, runid, "samples.jsonl")
+    if os.path.exists(sf):
+        for sl in open(sf):
+            sl=sl.strip()
+            if not sl: continue
+            try: s2=json.loads(sl)
+            except Exception: continue
+            samplerows.append({"ts":ts,"runid":runid,"step_idx":int(s2.get("step_idx",0)),
+                "t_offset_s":int(s2.get("t_offset_s",0)),"cpu_util":float(s2.get("cpu_util",0)),
+                "recvq":int(s2.get("recvq",0)),"completed_cps":0,"p99_accept_ms":0.0})
 if not rows:
     raise SystemExit(0)
 def insert(table, data):
@@ -71,7 +85,7 @@ def insert(table, data):
     if p.returncode!=0:
         import sys; sys.stderr.write(f"[flush-ch] {table} insert failed: "+p.stderr[:300]+"\n"); raise SystemExit(1)
     return len(data)
-n=insert("runs", rows); insert("steps", steprows); insert("profile", profrows)
+n=insert("runs", rows); insert("steps", steprows); insert("profile", profrows); insert("samples", samplerows)
 print(n)
 PY
 rc=$?
