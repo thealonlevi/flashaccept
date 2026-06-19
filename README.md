@@ -69,8 +69,31 @@ int main(void) {
 cc myserver.c -o myserver -lflashaccept -luring -lpthread
 ```
 
+### Install
+
+```bash
+sudo make install                 # PREFIX=/usr/local by default
+# then, in your build:
+cc myserver.c $(pkg-config --cflags --libs flashaccept) -o myserver
+```
+
+`make install` places the header, `libflashaccept.{a,so}` (with a versioned SONAME
+`libflashaccept.so.1`), and a `flashaccept.pc` for pkg-config. Override `PREFIX`/`DESTDIR` for
+packaging (`make install PREFIX=/usr DESTDIR=pkgroot`).
+
 Requires Linux with io_uring (kernel ≥ 5.x; multishot accept uses ≥ 5.19, with graceful fallback)
 and liburing. Full reference: [docs/API.md](docs/API.md).
+
+## Scope & limitations
+
+flashaccept targets the **accept-heavy "request → reply → close"** workload (health checks,
+redirectors, tiny RPC/HTTP replies, load-balancer probes). In v1:
+
+- One request, one reply, then close — **no keep-alive / multi-exchange** connections.
+- The handler is invoked once per connection on the first batch of request bytes; it assumes the
+  request fits in a single `recv` (true for small requests). Larger/streamed requests aren't the
+  target use case.
+- Linux only (io_uring). Graceful fallback to single-shot accept + regular fds on older kernels.
 
 ## How it works
 

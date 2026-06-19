@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use flashaccept, please cite it."
+title: "flashaccept: a fast io_uring TCP accept engine for Linux"
+abstract: >-
+  An importable C library that accepts TCP connections with minimal CPU per connection on Linux
+  io_uring (multishot accept, registered/direct descriptors, per-worker connection freelist,
+  MSG_MORE reply+FIN fusion, batched submit/harvest). The optimized accept path was discovered by
+  an autonomous optimizer; the full benchmark and optimization rig is in research/.
+type: software
+authors:
+  - family-names: Levi
+    given-names: Alon
+    email: levialon@proton.me
+repository-code: "https://github.com/thealonlevi/flashaccept"
+license: MIT
+version: 1.0.0
+date-released: 2026-06-19
+keywords:
+  - io_uring
+  - tcp
+  - accept
+  - performance
+  - linux
+  - networking

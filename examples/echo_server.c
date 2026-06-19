@@ -43,17 +43,18 @@ static void on_signal(int sig)
 
 int main(int argc, char **argv)
 {
-    int port = 12480;
+    int port = 12480, multishot = 1, direct = 1;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--port") && i + 1 < argc)
-            port = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--port") && i + 1 < argc)        port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--multishot") && i + 1 < argc) multishot = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--direct") && i + 1 < argc)    direct = atoi(argv[++i]);
     }
 
     fa_config cfg = {0};
     cfg.port         = port;
-    cfg.workers      = 0;   /* one worker per available CPU */
-    cfg.multishot    = 1;   /* multishot accept (with fallback) */
-    cfg.direct_files = 1;   /* registered/direct descriptors (with fallback) */
+    cfg.workers      = 0;          /* one worker per available CPU */
+    cfg.multishot    = multishot;  /* 1 = multishot accept (with fallback to single-shot) */
+    cfg.direct_files = direct;     /* 1 = registered/direct descriptors (with fallback) */
 
     g_server = fa_server_new(&cfg, handler, NULL);
     if (!g_server) {
