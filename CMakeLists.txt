@@ -23,7 +23,12 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 option(FLASHACCEPT_BUILD_EXAMPLES "Build example programs" ON)
 option(FLASHACCEPT_BUILD_SHARED   "Build the shared library" ON)
+option(FLASHACCEPT_BUILD_STATIC   "Build the static library" ON)
 option(FLASHACCEPT_INSTALL        "Generate install rules" ON)
+
+if(NOT FLASHACCEPT_BUILD_SHARED AND NOT FLASHACCEPT_BUILD_STATIC)
+    message(FATAL_ERROR "Enable at least one of FLASHACCEPT_BUILD_SHARED / FLASHACCEPT_BUILD_STATIC")
+endif()
 
 # --- liburing (>= 2.3) -------------------------------------------------------
 # Prefer a CMake config (vcpkg/Conan may ship one), then pkg-config, then a bare
@@ -52,14 +57,19 @@ endif()
 find_package(Threads REQUIRED)
 
 # --- libraries ---------------------------------------------------------------
-# One source set, built into a static and (optionally) a shared library. Public
-# headers are exposed via the include/ dir at build time and ${INCLUDEDIR} once
-# installed; liburing/Threads are PRIVATE (the public header does not expose them)
-# but CMake still threads them onto consumers of the *static* archive.
-set(_fa_targets flashaccept_static)
+# One source set, built into a static and/or a shared library (vcpkg/Conan pick
+# the linkage per triplet). Public headers are exposed via include/ at build time
+# and ${INCLUDEDIR} once installed; liburing/Threads are PRIVATE (the public
+# header does not expose them) but CMake still threads them onto consumers of the
+# static archive. The canonical consumer target flashaccept::flashaccept resolves
+# to the shared library when built, otherwise the static one.
+set(_fa_targets)
 
-add_library(flashaccept_static STATIC src/flashaccept.c)
-set_target_properties(flashaccept_static PROPERTIES OUTPUT_NAME flashaccept)
+if(FLASHACCEPT_BUILD_STATIC)
+    add_library(flashaccept_static STATIC src/flashaccept.c)
+    set_target_properties(flashaccept_static PROPERTIES OUTPUT_NAME flashaccept)
+    list(APPEND _fa_targets flashaccept_static)
+endif()
 
 if(FLASHACCEPT_BUILD_SHARED)
     add_library(flashaccept_shared SHARED src/flashaccept.c)
@@ -68,12 +78,16 @@ if(FLASHACCEPT_BUILD_SHARED)
         VERSION   ${PROJECT_VERSION}
         SOVERSION ${PROJECT_VERSION_MAJOR})
     list(APPEND _fa_targets flashaccept_shared)
-    # Canonical consumer name flashaccept::flashaccept resolves to the shared lib;
-    # the static archive is also exported as flashaccept::flashaccept-static.
+endif()
+
+# Decide which target carries the canonical EXPORT_NAME "flashaccept".
+if(FLASHACCEPT_BUILD_SHARED)
     set_target_properties(flashaccept_shared PROPERTIES EXPORT_NAME flashaccept)
-    set_target_properties(flashaccept_static PROPERTIES EXPORT_NAME flashaccept-static)
     add_library(flashaccept::flashaccept ALIAS flashaccept_shared)
-    add_library(flashaccept::flashaccept-static ALIAS flashaccept_static)
+    if(FLASHACCEPT_BUILD_STATIC)
+        set_target_properties(flashaccept_static PROPERTIES EXPORT_NAME flashaccept-static)
+        add_library(flashaccept::flashaccept-static ALIAS flashaccept_static)
+    endif()
 else()
     set_target_properties(flashaccept_static PROPERTIES EXPORT_NAME flashaccept)
     add_library(flashaccept::flashaccept ALIAS flashaccept_static)
@@ -90,7 +104,7 @@ endforeach()
 # --- example -----------------------------------------------------------------
 if(FLASHACCEPT_BUILD_EXAMPLES)
     add_executable(echo_server examples/echo_server.c)
-    target_link_libraries(echo_server PRIVATE flashaccept_static liburing::liburing Threads::Threads)
+    target_link_libraries(echo_server PRIVATE flashaccept::flashaccept liburing::liburing Threads::Threads)
     set_target_properties(echo_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                           ${CMAKE_CURRENT_SOURCE_DIR}/examples)
 endif()
