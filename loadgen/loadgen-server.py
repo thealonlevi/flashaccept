@@ -59,7 +59,8 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/health":
-            self._send(200, {"ok": True, "loadgen_present": os.path.exists(LOADGEN), "max_duration": MAX_DURATION})
+            self._send(200, {"ok": True, "loadgen_present": os.path.exists(LOADGEN),
+                             "max_duration": MAX_DURATION, "cores": os.cpu_count() or 1})
         elif u.path == "/run":
             try: self._send(200, run_loadgen(parse_qs(u.query)))
             except Exception as e: self._send(500, {"error": str(e)})

@@ -15,6 +15,14 @@ WARMUP="${WARMUP_OVERRIDE:-$WARMUP}"
 MEASURE="${MEASURE_OVERRIDE:-$MEASURE}"
 N="${N_OVERRIDE:-$N}"
 RAMP_CONF="${RAMP_OVERRIDE:-$RAMP_CONF}"
+# auto-size loadgen threads to the load generator's core count (it must out-supply the SUT)
+if [ "${LG_THREADS:-auto}" = auto ]; then
+  if [ -n "${LOADGEN_URL:-}" ]; then
+    LG_THREADS=$(curl -fsS --max-time 5 "$LOADGEN_URL/health" 2>/dev/null | python3 -c "import sys,json;print(max(4,int(json.load(sys.stdin).get('cores',8))))" 2>/dev/null || echo 8)
+  else
+    LG_THREADS=$(nproc 2>/dev/null || echo 8)
+  fi
+fi
 RUNID="$(date +%Y%m%d-%H%M%S)-$ARM-$$"
 RUNDIR="$RESULTS_DIR/$RUNID"; mkdir -p "$RUNDIR"
 SUTCG=/sys/fs/cgroup/accept-bench-sut
@@ -85,54 +93,73 @@ smoke(){
   return 1
 }
 
-# ---- 3. one ramp -> max sustained conn/s ----------------------------------
-run_ramp(){   # run_ramp <stepfile> <do_sample> -> echoes "<max_sustained_conn_s> <ceiling_reason>"
-  local stepfile="$1" do_sample="${2:-0}"; : > "$stepfile"
+# ---- 3. ramp -> max sustained conn/s --------------------------------------
+# measure_step <rate> <idx> <do_sample>: one warmup+measure window. Appends the step JSON (and
+# per-second samples when do_sample), and returns metrics via globals M_COMP/M_CPU/M_RECVQ/M_DROP/M_GATE.
+measure_step(){
+  local RATE="$1" idx="$2" do_sample="$3"
+  loadgen_run "$RATE" "$WARMUP" "$LG_THREADS" "$SAMPLE_PCT" >/dev/null 2>&1   # warmup
+  local u0 u1 wall mq res samp="$RUNDIR/.samp"
+  u0=$(cpu_usec); local s0=$SECONDS; : > "$samp"
+  ( for ((i=1;i<=MEASURE;i++)); do sleep 1; printf '%d %s %s\n' "$i" "$(cpu_usec)" "$(max_recvq)"; done ) > "$samp" &
+  local sp=$!
+  res=$(loadgen_run "$RATE" "$MEASURE" "$LG_THREADS" "$SAMPLE_PCT")
+  wait "$sp" 2>/dev/null
+  u1=$(cpu_usec); wall=$(( (SECONDS-s0>0?SECONDS-s0:1) ))
+  mq=$(awk '{print $3}' "$samp" | sort -n | tail -1); mq=${mq:-0}
+  [ "$do_sample" = 1 ] && awk -v u0="$u0" -v idx="$idx" -v c="$CORES" 'BEGIN{prev=u0}
+      {util=($2-prev)/(c*1000000); if(util<0)util=0;
+       printf "{\"step_idx\":%d,\"t_offset_s\":%d,\"cpu_util\":%.3f,\"recvq\":%d}\n",idx,$1,util,$3; prev=$2}' \
+      "$samp" >> "$RUNDIR/samples.jsonl"
+  local comp drop ok p99 p999 maxms cpuutil=0
+  comp=$(echo "$res" | sed 's/.*"completed_cps":\([0-9.]*\).*/\1/')
+  drop=$(echo "$res" | sed 's/.*"drop_rate":\([0-9.]*\).*/\1/')
+  ok=$(echo "$res"   | grep -o '"reply_ok":[a-z]*' | cut -d: -f2)
+  p99=$(echo "$res"  | sed 's/.*"p99_ms":\([0-9.]*\).*/\1/')
+  p999=$(echo "$res" | sed 's/.*"p99_9_ms":\([0-9.]*\).*/\1/')
+  maxms=$(echo "$res"| sed 's/.*"max_ms":\([0-9.]*\).*/\1/')
+  [ -n "$u0" ] && [ -n "$u1" ] && cpuutil=$(awk -v d=$((u1-u0)) -v c="$CORES" -v w="$wall" 'BEGIN{printf "%.3f", d/(c*w*1000000)}')
+  printf '{"idx":%d,"offered":%d,"completed_cps":%s,"drop_rate":%s,"reply_ok":"%s","cpu_util":%s,"max_recvq":%s,"p99_ms":%s,"p99_9_ms":%s,"max_ms":%s}\n' \
+    "$idx" "$RATE" "${comp:-0}" "${drop:-1}" "${ok:-false}" "$cpuutil" "${mq:-0}" "${p99:-0}" "${p999:-0}" "${maxms:-0}" >> "$STEPFILE"
+  local gate_ok=1; [ "$ok" = "true" ] || gate_ok=0
+  awk -v d="${drop:-1}" -v c="$DROP_CEILING" 'BEGIN{exit !(d<c)}' || gate_ok=0
+  log "  step $idx: offered=$RATE completed=${comp:-0}/s drop=${drop} reply_ok=${ok} cpu=${cpuutil} recvq=${mq} gate=$gate_ok"
+  M_COMP=${comp:-0}; M_CPU=$cpuutil; M_RECVQ=${mq:-0}; M_DROP=${drop:-1}; M_GATE=$gate_ok
+}
+
+# run_ramp <stepfile> <do_sample> -> echoes "<max_sustained_conn_s> <ceiling_reason>".
+# RAMP_MODE=adaptive: auto-scale offered load (geometric) until the SUT tops out — no hand-tuned
+# rates. Stops on: gate fail | queue backpressure | CPU saturation | throughput plateau | RAMP_MAX.
+# RAMP_MODE=fixed: step through harness/ramp.conf (legacy).
+run_ramp(){
+  local stepfile="$1" do_sample="${2:-0}"; STEPFILE="$stepfile"; : > "$stepfile"
   local best=0 reason="none" idx=0
-  while read -r RATE; do
-    [[ "$RATE" =~ ^[0-9]+$ ]] || continue
-    # warmup
-    loadgen_run "$RATE" "$WARMUP" "${LG_THREADS:-8}" "$SAMPLE_PCT" >/dev/null 2>&1
-    # measure: sample cpu+recvq every 1s CONCURRENTLY with the load (previously sampled before the
-    # load, so recvq always read 0 — fixed). Per-second rows feed acceptbench.samples when do_sample.
-    local u0 u1 wall mq res samp="$RUNDIR/.samp"
-    u0=$(cpu_usec); local s0=$SECONDS; : > "$samp"
-    ( for ((i=1;i<=MEASURE;i++)); do sleep 1; printf '%d %s %s\n' "$i" "$(cpu_usec)" "$(max_recvq)"; done ) > "$samp" &
-    local sp=$!
-    res=$(loadgen_run "$RATE" "$MEASURE" "${LG_THREADS:-8}" "$SAMPLE_PCT")
-    wait "$sp" 2>/dev/null
-    u1=$(cpu_usec); wall=$(( (SECONDS-s0>0?SECONDS-s0:1) ))
-    mq=$(awk '{print $3}' "$samp" | sort -n | tail -1); mq=${mq:-0}
-    if [ "$do_sample" = 1 ]; then
-      awk -v u0="$u0" -v idx="$idx" -v c="$CORES" 'BEGIN{prev=u0}
-        {util=($2-prev)/(c*1000000); if(util<0)util=0;
-         printf "{\"step_idx\":%d,\"t_offset_s\":%d,\"cpu_util\":%.3f,\"recvq\":%d}\n",idx,$1,util,$3; prev=$2}' \
-        "$samp" >> "$RUNDIR/samples.jsonl"
-    fi
-    local comp drop ok p99 p999 maxms
-    comp=$(echo "$res" | sed 's/.*"completed_cps":\([0-9.]*\).*/\1/')
-    drop=$(echo "$res" | sed 's/.*"drop_rate":\([0-9.]*\).*/\1/')
-    ok=$(echo "$res"   | grep -o '"reply_ok":[a-z]*' | cut -d: -f2)
-    p99=$(echo "$res"  | sed 's/.*"p99_ms":\([0-9.]*\).*/\1/')
-    p999=$(echo "$res" | sed 's/.*"p99_9_ms":\([0-9.]*\).*/\1/')
-    maxms=$(echo "$res"| sed 's/.*"max_ms":\([0-9.]*\).*/\1/')
-    local cpuutil=0
-    [ -n "$u0" ] && [ -n "$u1" ] && cpuutil=$(awk -v d=$((u1-u0)) -v c="$CORES" -v w="$wall" 'BEGIN{printf "%.3f", d/(c*w*1000000)}')
-    printf '{"idx":%d,"offered":%d,"completed_cps":%s,"drop_rate":%s,"reply_ok":"%s","cpu_util":%s,"max_recvq":%s,"p99_ms":%s,"p99_9_ms":%s,"max_ms":%s}\n' \
-      "$idx" "$RATE" "${comp:-0}" "${drop:-1}" "${ok:-false}" "$cpuutil" "${mq:-0}" "${p99:-0}" "${p999:-0}" "${maxms:-0}" >> "$stepfile"
-    log "step $idx: offered=$RATE completed=${comp:-0}/s drop=${drop} reply_ok=${ok} cpu=${cpuutil} recvq=${mq}"
-    # gate
-    local gate_ok=1
-    [ "$ok" = "true" ] || gate_ok=0
-    awk -v d="${drop:-1}" -v c="$DROP_CEILING" 'BEGIN{exit !(d<c)}' || gate_ok=0
-    if [ "$gate_ok" -eq 0 ]; then reason="gate_fail"; log "  gate FAILED at $RATE -> stop ramp"; break; fi
-    # this step passed -> candidate ceiling
-    best=$(awk -v b="$best" -v c="${comp:-0}" 'BEGIN{printf "%d", (c>b?c:b)}')
-    # ceiling detection
-    if [ "${mq:-0}" -gt "$QUEUE_HIGH" ]; then reason="queue_backpressure"; log "  recvq ${mq}>${QUEUE_HIGH} -> ceiling"; break; fi
-    awk -v u="$cpuutil" 'BEGIN{exit !(u>0.98)}' && { reason="cpu_saturation"; log "  cpu saturated -> ceiling"; break; }
-    idx=$((idx+1))
-  done < "$RAMP_CONF"
+  ceiling_hit(){ # uses M_*; sets reason; returns 0 if we should stop
+    [ "$M_GATE" -eq 0 ] && { reason="gate_fail"; log "  -> gate fail, stop"; return 0; }
+    best=$(awk -v b="$best" -v c="$M_COMP" 'BEGIN{printf "%d",(c>b?c:b)}')
+    [ "$M_RECVQ" -gt "$QUEUE_HIGH" ] && { reason="queue_backpressure"; log "  -> recvq>$QUEUE_HIGH, ceiling"; return 0; }
+    awk -v u="$M_CPU" 'BEGIN{exit !(u>0.98)}' && { reason="cpu_saturation"; log "  -> cpu saturated, ceiling"; return 0; }
+    return 1
+  }
+  if [ "${RAMP_MODE:-adaptive}" = adaptive ]; then
+    local rate="${RAMP_START:-5000}" prev=0
+    while [ "$rate" -le "${RAMP_MAX:-2000000}" ]; do
+      measure_step "$rate" "$idx" "$do_sample"
+      ceiling_hit && break
+      # throughput plateau: completed grew < PLATEAU_GAIN despite offered growing -> can't go higher
+      if [ "$idx" -gt 0 ] && awk -v c="$M_COMP" -v p="$prev" -v g="${PLATEAU_GAIN:-0.03}" 'BEGIN{exit !(c<=p*(1+g))}'; then
+        reason="throughput_plateau"; log "  -> completed plateau ($M_COMP vs $prev), ceiling"; break; fi
+      prev="$M_COMP"; idx=$((idx+1))
+      rate=$(awk -v r="$rate" -v g="${RAMP_GROWTH:-1.5}" 'BEGIN{printf "%d", r*g}')
+    done
+  else
+    while read -r RATE; do
+      [[ "$RATE" =~ ^[0-9]+$ ]] || continue
+      measure_step "$RATE" "$idx" "$do_sample"
+      ceiling_hit && break
+      idx=$((idx+1))
+    done < "$RAMP_CONF"
+  fi
   echo "$best $reason"
 }
 
