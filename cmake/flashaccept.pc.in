@@ -1,0 +1,13 @@
+prefix=@FA_PC_PREFIX@
+exec_prefix=${prefix}
+libdir=@FA_PC_LIBDIR@
+includedir=@FA_PC_INCLUDEDIR@
+
+Name: flashaccept
+Description: Fast io_uring TCP accept engine for Linux
+URL: https://github.com/thealonlevi/flashaccept
+Version: @PROJECT_VERSION@
+Requires.private: @PKG_CONFIG_REQUIRES@
+Libs: -L${libdir} -lflashaccept
+Libs.private: -luring -lpthread
+Cflags: -I${includedir}

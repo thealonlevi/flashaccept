@@ -8,7 +8,7 @@
 #
 # Override PREFIX/DESTDIR for packaging, e.g. `make install PREFIX=/usr DESTDIR=pkgroot`.
 
-VERSION  := 1.0.0
+VERSION  := 1.0.1
 SOVER    := 1
 
 CC      ?= cc

@@ -3,6 +3,18 @@
 All notable changes to flashaccept are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [1.0.1] — 2026-06-19
+
+Packaging release: first-class support for vcpkg, Conan, and the AUR. No API or ABI change
+(SONAME remains `libflashaccept.so.1`).
+
+### Added
+- CMake `install()` with an exported package config — downstreams can now
+  `find_package(flashaccept CONFIG REQUIRED)` and link `flashaccept::flashaccept`.
+- CMake-generated `flashaccept.pc` (pkg-config), kept in lockstep with the Makefile's.
+- Package recipes under `packaging/`: a vcpkg port, a Conan recipe (+ test package), and an
+  AUR `PKGBUILD`/`.SRCINFO`. See [`packaging/README.md`](packaging/README.md).
+
 ## [1.0.0] — 2026-06-19
 
 First public release. A fast, importable io_uring TCP accept engine for Linux.

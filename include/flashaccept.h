@@ -67,8 +67,8 @@
 
 #define FLASHACCEPT_VERSION_MAJOR 1
 #define FLASHACCEPT_VERSION_MINOR 0
-#define FLASHACCEPT_VERSION_PATCH 0
-#define FLASHACCEPT_VERSION       "1.0.0"
+#define FLASHACCEPT_VERSION_PATCH 1
+#define FLASHACCEPT_VERSION       "1.0.1"
 
 #ifdef __cplusplus
 extern "C" {

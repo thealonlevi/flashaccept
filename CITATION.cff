@@ -13,7 +13,7 @@ authors:
     email: levialon@proton.me
 repository-code: "https://github.com/thealonlevi/flashaccept"
 license: MIT
-version: 1.0.0
+version: 1.0.1
 date-released: 2026-06-19
 keywords:
   - io_uring

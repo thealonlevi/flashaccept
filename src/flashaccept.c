@@ -78,7 +78,7 @@
 #error "flashaccept requires liburing >= 2.3. Upgrade liburing-dev, or build it from source: https://github.com/axboe/liburing"
 #endif
 
-#define FA_VERSION_STR "1.0.0"
+#define FA_VERSION_STR "1.0.1"
 
 /* Tunables that are not worth exposing in the public API. */
 #define FA_QUEUE_DEPTH   4096   /* io_uring SQ/CQ depth per worker.            */

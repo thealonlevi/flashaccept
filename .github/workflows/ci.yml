@@ -37,6 +37,21 @@ jobs:
           PKG_CONFIG_PATH=/tmp/fa/lib/pkgconfig \
             cc -O2 examples/echo_server.c $(PKG_CONFIG_PATH=/tmp/fa/lib/pkgconfig pkg-config --cflags --libs flashaccept) \
                -Wl,-rpath,/tmp/fa/lib -o /tmp/consumer
+      - name: CMake build + install + find_package consumer
+        run: |
+          sudo apt-get install -y cmake
+          cmake -S . -B /tmp/cmkbuild -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/cmkbuild -j"$(nproc)"
+          cmake --install /tmp/cmkbuild --prefix /tmp/cmkinst
+          test -f /tmp/cmkinst/lib/cmake/flashaccept/flashaccept-config.cmake
+          test -f /tmp/cmkinst/lib/pkgconfig/flashaccept.pc
+          # downstream find_package(flashaccept CONFIG)
+          mkdir -p /tmp/fpkg && cd /tmp/fpkg
+          printf '#include <flashaccept.h>\n#include <stdio.h>\nint main(void){printf("%%s\\n",fa_version());return 0;}\n' > app.c
+          printf 'cmake_minimum_required(VERSION 3.14)\nproject(c C)\nfind_package(flashaccept CONFIG REQUIRED)\nadd_executable(app app.c)\ntarget_link_libraries(app PRIVATE flashaccept::flashaccept)\n' > CMakeLists.txt
+          cmake -S . -B b -DCMAKE_PREFIX_PATH=/tmp/cmkinst
+          cmake --build b
+          LD_LIBRARY_PATH=/tmp/cmkinst/lib ./b/app
       - name: Smoke test (fast path + full fallback)
         run: |
           cat > /tmp/probe.c <<'C'
