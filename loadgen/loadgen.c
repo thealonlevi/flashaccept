@@ -26,6 +26,8 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
+#include <ifaddrs.h>
+#include <stdatomic.h>
 
 static const char REPLY[]   = "HTTP/1.1 200 OK\r\n\r\n";  // 19 bytes, byte-for-byte
 static const int  REPLY_LEN = 19;
@@ -67,12 +69,36 @@ typedef struct {
 } worker_t;
 
 static struct sockaddr_in g_addr;
+// source-IP pool: bind each new connection to a rotating local IP, so one box drives many source
+// connections (expands the 4-tuple space past one IP's ~64k ports, spreads NIC RX queues / RSS).
+static struct in_addr g_src[256]; static int g_nsrc=0; static atomic_uint g_srci=0;
 
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec + t.tv_nsec/1e9; }
 static long us_since(struct timespec *a){ struct timespec b; clock_gettime(CLOCK_MONOTONIC,&b);
     return (b.tv_sec-a->tv_sec)*1000000L + (b.tv_nsec-a->tv_nsec)/1000; }
 
 static int set_nonblock(int fd){ int f=fcntl(fd,F_GETFL,0); return fcntl(fd,F_SETFL,f|O_NONBLOCK); }
+
+// populate the source-IP pool: "auto" enumerates this box's non-loopback IPv4 addrs; otherwise a
+// comma-separated list. These must be locally assigned and routable back from the SUT.
+static void fill_src(const char *spec){
+    if(!strcmp(spec,"auto")){
+        struct ifaddrs *ifa,*p;
+        if(getifaddrs(&ifa)==0){
+            for(p=ifa;p&&g_nsrc<256;p=p->ifa_next){
+                if(!p->ifa_addr||p->ifa_addr->sa_family!=AF_INET) continue;
+                struct in_addr a=((struct sockaddr_in*)p->ifa_addr)->sin_addr;
+                if((ntohl(a.s_addr)>>24)==127) continue;  // skip loopback
+                g_src[g_nsrc++]=a;
+            }
+            freeifaddrs(ifa);
+        }
+    } else {
+        char buf[4096]; strncpy(buf,spec,sizeof buf-1); buf[sizeof buf-1]=0;
+        for(char *t=strtok(buf,",");t&&g_nsrc<256;t=strtok(NULL,","))
+            if(inet_pton(AF_INET,t,&g_src[g_nsrc])==1) g_nsrc++;
+    }
+}
 
 static void hist_add(worker_t *w, long us){ long b=us/HUS_PER; if(b<0)b=0; if(b>HBUCKETS)b=HBUCKETS; w->hist[b]++; }
 
@@ -92,6 +118,12 @@ static int conn_start(worker_t *w, int ep, conn_t **slot){
     int fd = socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, 0);
     if(fd<0){ w->failed[F_OTHER]++; return -1; }
     int one=1; setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&one,sizeof one);
+    if(g_nsrc>0){  // round-robin bind to a source IP from the pool
+        setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
+        struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET;
+        sa.sin_addr=g_src[atomic_fetch_add(&g_srci,1)%g_nsrc]; sa.sin_port=0;
+        bind(fd,(struct sockaddr*)&sa,sizeof sa);
+    }
     conn_t *c = calloc(1,sizeof *c);
     c->fd=fd; c->state=0; c->got=0; c->sent=0;
     c->sampled = (w->sample_pct>0) && ((w->offered % 100) < (uint64_t)w->sample_pct);
@@ -193,6 +225,7 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--duration")&&i+1<argc) dur=atof(argv[++i]);
         else if(!strcmp(argv[i],"--threads")&&i+1<argc) threads=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--sample-pct")&&i+1<argc) sample=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--source-ips")&&i+1<argc) fill_src(argv[++i]);
     }
     if(threads<1)threads=1;
     if(conns>0 && threads>conns) threads=conns;   // don't spawn more threads than target connections
@@ -207,6 +240,7 @@ int main(int argc,char**argv){
 
     worker_t *ws=calloc(threads,sizeof *ws);
     pthread_t *th=calloc(threads,sizeof *th);
+    struct rusage ru0; getrusage(RUSAGE_SELF,&ru0); double wall0=now_s();
     for(int i=0;i<threads;i++){
         ws[i].id=i; ws[i].nthreads=threads; ws[i].port=port; ws[i].rate=rate/threads;
         ws[i].conns = conns>0 ? (conns/threads + (i < conns%threads ? 1 : 0)) : 0;
@@ -214,6 +248,12 @@ int main(int argc,char**argv){
         pthread_create(&th[i],NULL,worker_main,&ws[i]);
     }
     for(int i=0;i<threads;i++) pthread_join(th[i],NULL);
+    // loadgen's OWN cpu usage (so the harness can confirm the load generator isn't the bottleneck)
+    struct rusage ru1; getrusage(RUSAGE_SELF,&ru1); double wall1=now_s();
+    double cpu_s=(ru1.ru_utime.tv_sec-ru0.ru_utime.tv_sec)+(ru1.ru_utime.tv_usec-ru0.ru_utime.tv_usec)/1e6
+                +(ru1.ru_stime.tv_sec-ru0.ru_stime.tv_sec)+(ru1.ru_stime.tv_usec-ru0.ru_stime.tv_usec)/1e6;
+    long ncpu=sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<1)ncpu=1;
+    double lg_cpu_frac=(wall1>wall0)? cpu_s/((wall1-wall0)*ncpu) : 0;   // fraction of the whole box
 
     // aggregate
     uint64_t offered=0,completed=0,failed_total=0,failed[F_NREASONS]={0},stot=0,sbad=0;
@@ -242,6 +282,7 @@ int main(int argc,char**argv){
     printf("\"drop_rate\":%.6f,\"reply_ok\":%s,",drop,reply_ok?"true":"false");
     printf("\"sampled\":%lu,\"sampled_bad\":%lu,",stot,sbad);
     printf("\"p50_ms\":%.3f,\"p99_ms\":%.3f,\"p99_9_ms\":%.3f,\"max_ms\":%.3f,",p50us/1000.0,p99us/1000.0,p999us/1000.0,maxus/1000.0);
+    printf("\"loadgen_cpu\":%.4f,\"loadgen_cores\":%ld,\"source_ips\":%d,\"threads\":%d,",lg_cpu_frac,ncpu,g_nsrc,threads);
     printf("\"fail_reasons\":{");
     for(int r=0;r<F_NREASONS;r++) printf("%s\"%s\":%lu",r?",":"",F_NAME[r],failed[r]);
     printf("}}\n");

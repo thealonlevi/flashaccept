@@ -29,6 +29,7 @@ SAMPLE_PCT=5                 # % of connections fully payload-validated by the g
 # --- ramp / timing ----------------------------------------------------------
 RAMP_CONF="harness/ramp.conf"
 LG_THREADS="auto"            # loadgen worker threads; "auto" = the load-generator's core count
+LG_SOURCE_IPS=""             # ""=single source IP | "auto"=all box-2 IPs | "ip1,ip2,..." (for very high rates)
 # adaptive ramp: auto-scale CONCURRENCY (in-flight connections, closed-loop) until the SUT tops
 # out — no hand-tuned rates, and it can't congestion-collapse over a high-latency link.
 RAMP_MODE="adaptive"         # adaptive (scale concurrency) | fixed (offered rates from ramp.conf)
@@ -39,7 +40,8 @@ PLATEAU_GAIN=0.03            # stop if completed grows <3% despite more concurre
 WARMUP=10                    # seconds per step before measuring
 MEASURE=30                   # seconds measured per step
 SETTLE=3                     # quiet delay between runs (+ drop_caches)
-N=3                          # repetitions per scored config; score = median
+N=5                          # load tests per scored config; score = MEAN of reps (averages out noise)
+# SCORE = CPU efficiency = connections served per core-second = conn_s / (cpu_util * CORES).
 SMOKE_TIMEOUT=20             # arm must pass a 100-conn smoke test within this many seconds
 
 # --- optimizer loop knobs ---------------------------------------------------

@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS acceptbench.runs (
   score               Float64,
   max_sustained_conn_s UInt64,
   cores               UInt16,
+  cpu_at_ceiling      Float64,             -- score = max_sustained_conn_s / (cpu_at_ceiling*cores)
   ceiling_reason      LowCardinality(String),
   gate_passed         UInt8,
   drop_rate           Float64,

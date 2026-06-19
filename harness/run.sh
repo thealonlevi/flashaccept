@@ -75,10 +75,11 @@ loadgen_run(){
     curl -fsS --max-time $((dur+30)) -G "$LOADGEN_URL/run" \
       --data-urlencode "host=$TARGET_HOST" --data-urlencode "port=$PORT" \
       --data-urlencode "$kind=$level"      --data-urlencode "duration=$dur" \
-      --data-urlencode "threads=$th"       --data-urlencode "sample_pct=$sp" 2>/dev/null
+      --data-urlencode "threads=$th"       --data-urlencode "sample_pct=$sp" \
+      ${LG_SOURCE_IPS:+--data-urlencode "source_ips=$LG_SOURCE_IPS"} 2>/dev/null
   else
     loadgen/loadgen --host "$TARGET_HOST" --port "$PORT" "--$kind" "$level" --duration "$dur" \
-      --threads "$th" --sample-pct "$sp"
+      --threads "$th" --sample-pct "$sp" ${LG_SOURCE_IPS:+--source-ips "$LG_SOURCE_IPS"}
   fi
 }
 
@@ -133,23 +134,26 @@ measure_step(){
 # RAMP_MODE=adaptive: auto-scale offered load (geometric) until the SUT tops out — no hand-tuned
 # rates. Stops on: gate fail | queue backpressure | CPU saturation | throughput plateau | RAMP_MAX.
 # RAMP_MODE=fixed: step through harness/ramp.conf (legacy).
-run_ramp(){
+run_ramp(){   # echoes "<best_conn_s> <ceiling_reason> <cpu_at_best>"
   local stepfile="$1" do_sample="${2:-0}"; STEPFILE="$stepfile"; : > "$stepfile"
-  local best=0 reason="none" idx=0
+  local best=0 reason="none" idx=0 bcpu=0
+  CEIL_CONNS="${CONN_START:-32}"   # in-flight level that achieved `best` (for the profiling passes)
+  note_best(){ # $1=level ; if this gate-passing step beat `best`, record conn/s + cpu + level
+    [ "$M_GATE" -eq 0 ] && return
+    awk -v c="$M_COMP" -v b="$best" 'BEGIN{exit !(c>b)}' && { best="$M_COMP"; bcpu="$M_CPU"; CEIL_CONNS="$1"; }
+  }
   ceiling_hit(){ # uses M_*; sets reason; returns 0 if we should stop
     [ "$M_GATE" -eq 0 ] && { reason="gate_fail"; log "  -> gate fail, stop"; return 0; }
-    best=$(awk -v b="$best" -v c="$M_COMP" 'BEGIN{printf "%d",(c>b?c:b)}')
     [ "$M_RECVQ" -gt "$QUEUE_HIGH" ] && { reason="queue_backpressure"; log "  -> recvq>$QUEUE_HIGH, ceiling"; return 0; }
     awk -v u="$M_CPU" 'BEGIN{exit !(u>0.98)}' && { reason="cpu_saturation"; log "  -> cpu saturated, ceiling"; return 0; }
     return 1
   }
-  CEIL_CONNS="${CONN_START:-32}"   # in-flight level that achieved `best` (for the profiling passes)
   if [ "${RAMP_MODE:-adaptive}" = adaptive ]; then
     # scale CONCURRENCY (in-flight connections), not offered rate: closed-loop can't congestion-collapse
     local conns="${CONN_START:-32}" prev=0
     while [ "$conns" -le "${CONN_MAX:-200000}" ]; do
       measure_step conns "$conns" "$idx" "$do_sample"
-      [ "$M_GATE" -ne 0 ] && awk -v c="$M_COMP" -v b="$best" 'BEGIN{exit !(c>b)}' && CEIL_CONNS="$conns"
+      note_best "$conns"
       ceiling_hit && break
       # throughput plateau: completed grew < PLATEAU_GAIN despite more concurrency -> SUT is the limit
       if [ "$idx" -gt 0 ] && awk -v c="$M_COMP" -v p="$prev" -v g="${PLATEAU_GAIN:-0.03}" 'BEGIN{exit !(c<=p*(1+g))}'; then
@@ -161,11 +165,12 @@ run_ramp(){
     while read -r RATE; do
       [[ "$RATE" =~ ^[0-9]+$ ]] || continue
       measure_step rate "$RATE" "$idx" "$do_sample"
+      note_best "$RATE"
       ceiling_hit && break
       idx=$((idx+1))
     done < "$RAMP_CONF"
   fi
-  echo "$best $reason"
+  echo "$best $reason $bcpu"
 }
 
 # ---- 4. syscall profile (best-effort analytics, not gated) ----------------
@@ -267,6 +272,7 @@ def loadjson(p):
 e=os.environ
 row=dict(runid=e["RUNID"],arm=e["ARM"],config_hash=e["CFG_HASH"] or None,
          score=float(e["SCORE"]),max_sustained_conn_s=int(float(e["MX"])),cores=int(e["CORES"]),
+         cpu_at_ceiling=float(e.get("CEIL_CPU","0") or 0),   # score = conn/s / (cpu_at_ceiling*cores)
          ceiling_reason=e["REASON"],env_fingerprint=e["ENVFP"],
          spread_pct=float(e["SPREAD"]),median_of=int(e["NREPS"]),
          per_step=loadsteps(e["STEPFILE"]),syscall_profile=loadjson(e["SYSCFILE"]),
@@ -284,20 +290,32 @@ if ! build_arm; then
 fi
 ENVFP="$(env_fingerprint)"
 log "built $BIN ; env=$ENVFP ; runid=$RUNID"
-declare -a SCORES=()
+# OBJECTIVE = CPU efficiency: connections served per core-second = conn_s / (cpu_util * CORES).
+# This is the "conn/s vs CPU usage ratio" — exactly riptide's question (accept conns with less CPU).
+# We measure each arm at its adaptive ceiling, N reps, and report the MEAN (averaging kills noise).
+declare -a CONNS=() CPUS=()
 REASON="none"
 for rep in $(seq 1 "$N"); do
   start_arm
   if ! smoke; then log "SMOKE FAILED (rep $rep) — score 0"; stop_arm; record_score 0 0 smoke_fail >/dev/null; echo '{"score":0,"reason":"smoke_fail"}'; exit 0; fi
   log "rep $rep/$N ramping…"
-  read -r mx REASON < <(run_ramp "$RUNDIR/steps.$rep.jsonl" "$([ "$rep" -eq 1 ] && echo 1 || echo 0)")
-  SCORES+=( "$mx" )
+  read -r mx REASON bcpu < <(run_ramp "$RUNDIR/steps.$rep.jsonl" "$([ "$rep" -eq 1 ] && echo 1 || echo 0)")
+  CONNS+=( "${mx:-0}" ); CPUS+=( "${bcpu:-0}" )
+  log "  rep $rep: conn_s=${mx:-0} cpu@ceiling=${bcpu:-0}"
   if [ "$rep" -eq 1 ]; then profile_syscalls "$RUNDIR/syscall.json"; perf_pass "$RUNDIR/perf.json"; profile_functions "$RUNDIR/funcprof.json"; fi
   stop_arm; sleep "$SETTLE"; sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 done
-# median of reps
-MEDIAN=$(printf '%s\n' "${SCORES[@]}" | sort -n | awk '{a[NR]=$1}END{print (NR%2)?a[(NR+1)/2]:int((a[NR/2]+a[NR/2+1])/2)}')
-SCORE=$(awk -v m="$MEDIAN" -v c="$CORES" 'BEGIN{printf "%.2f", m/c}')
-SPREAD=$(printf '%s\n' "${SCORES[@]}" | sort -n | awk '{a[NR]=$1}END{if(a[1]>0)printf "%.1f",(a[NR]-a[1])/a[1]*100; else print 0}')
-log "reps=${SCORES[*]} median_conn_s=$MEDIAN score=$SCORE spread=${SPREAD}% ceiling=$REASON"
-record_score "$SCORE" "$MEDIAN" "$REASON" "$RUNDIR/steps.1.jsonl" "$RUNDIR/syscall.json" "$RUNDIR/perf.json" "$SPREAD" "$RUNDIR/funcprof.json"
+# mean conn/s, mean cpu, and the efficiency ratio (+ its run-to-run spread)
+read -r MEAN_CONN MEAN_CPU SCORE SPREAD < <(python3 - "$CORES" "${CONNS[*]}" "${CPUS[*]}" <<'PY'
+import sys
+cores=float(sys.argv[1]); conns=[float(x) for x in sys.argv[2].split()]; cpus=[float(x) for x in sys.argv[3].split()]
+mc=sum(conns)/len(conns) if conns else 0
+mu=max(sum(cpus)/len(cpus) if cpus else 0, 0.005)        # floor cpu to avoid div blow-up
+eff=mc/(mu*cores) if mu>0 else 0                          # connections per core-second
+efs=[c/(max(u,0.005)*cores) for c,u in zip(conns,cpus)]  # per-rep efficiency for spread
+spread=(max(efs)-min(efs))/min(efs)*100 if efs and min(efs)>0 else 0
+print("%.0f %.4f %.1f %.1f"%(mc,mu,eff,spread))
+PY
+)
+log "reps_conn=${CONNS[*]} reps_cpu=${CPUS[*]} | mean_conn=$MEAN_CONN mean_cpu=$MEAN_CPU EFF(conn/core-s)=$SCORE spread=${SPREAD}% ceiling=$REASON"
+CEIL_CPU="$MEAN_CPU" record_score "$SCORE" "$MEAN_CONN" "$REASON" "$RUNDIR/steps.1.jsonl" "$RUNDIR/syscall.json" "$RUNDIR/perf.json" "$SPREAD" "$RUNDIR/funcprof.json"

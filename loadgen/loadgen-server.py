@@ -39,12 +39,16 @@ def run_loadgen(q):
     dur = min(float(g("duration", "5")), MAX_DURATION)
     threads = int(g("threads", "8"))
     sample = int(g("sample_pct", "5"))
+    source_ips = g("source_ips", "")     # "auto" or comma-separated; empty = single default IP
     # basic sanity to avoid abuse
     if not host.replace(".", "").replace(":", "").replace("-", "").isalnum():
         raise ValueError("bad host")
     cmd = [LOADGEN, "--host", host, "--port", str(port),
            "--duration", str(dur), "--threads", str(threads), "--sample-pct", str(sample)]
     cmd += (["--conns", str(conns)] if conns > 0 else ["--rate", str(rate)])
+    if source_ips:
+        if not all(ch.isalnum() or ch in ".,:-" for ch in source_ips): raise ValueError("bad source_ips")
+        cmd += ["--source-ips", source_ips]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=dur + 30)
     if out.returncode != 0:
         return {"error": "loadgen failed", "stderr": out.stderr[:400], "cmd": " ".join(map(shlex.quote, cmd))}
