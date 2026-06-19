@@ -1,0 +1,26 @@
+# Maintainer: Alon Levi <levialon@proton.me>
+pkgname=flashaccept
+pkgver=1.0.1
+pkgrel=1
+pkgdesc="Fast io_uring TCP accept engine for Linux (multishot accept, registered/direct descriptors, MSG_MORE reply+FIN fusion)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/thealonlevi/flashaccept"
+license=('MIT')
+depends=('liburing')
+makedepends=('cmake')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/thealonlevi/flashaccept/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('4e5528da4e856e51e8d049bbf9795b7afc9b109659a723ef8c739b0551117882')
+
+build() {
+  cmake -B build -S "$pkgname-$pkgver" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DFLASHACCEPT_BUILD_EXAMPLES=OFF
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm644 "$pkgname-$pkgver/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

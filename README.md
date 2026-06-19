@@ -81,6 +81,20 @@ cc myserver.c $(pkg-config --cflags --libs flashaccept) -o myserver
 `libflashaccept.so.1`), and a `flashaccept.pc` for pkg-config. Override `PREFIX`/`DESTDIR` for
 packaging (`make install PREFIX=/usr DESTDIR=pkgroot`).
 
+CMake consumers can instead `find_package(flashaccept CONFIG REQUIRED)` and link
+`flashaccept::flashaccept` (run `cmake --install`, or use one of the package managers below).
+
+### Package managers
+
+```bash
+vcpkg install flashaccept                              # vcpkg
+conan install --requires=flashaccept/1.0.1             # Conan / ConanCenter
+yay -S flashaccept                                     # Arch (AUR)
+```
+
+Recipes for all three live in [`packaging/`](packaging/) (and double as overlay/local-build
+recipes today while the registry submissions land).
+
 Requires Linux + **liburing ≥ 2.3** (Ubuntu 24.04+, or [build liburing from
 source](https://github.com/axboe/liburing)). The fast path uses kernel ≥ 5.19 (multishot accept);
 older kernels fall back to single-shot accept at runtime. Full reference: [docs/API.md](docs/API.md).

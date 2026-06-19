@@ -1,0 +1,5 @@
+# Local package-build artifacts (vcpkg buildtrees, Conan/CMake test_package builds)
+conan/all/test_package/build/
+conan/all/test_package/CMakeUserPresets.json
+**/CMakeCache.txt
+**/CMakeFiles/
