@@ -13,6 +13,8 @@ export PATH=$PATH:/usr/local/go/bin
 LOGDIR="$RESULTS_DIR/loop-logs"; mkdir -p "$LOGDIR"
 MAX_ITERS="${MAX_ITERS:-1000000}"
 log(){ echo "[loop $(date +%H:%M:%S)] $*"; }
+ITERCSV="$LOGDIR/iterations.csv"; CUM_COST=0
+[ -f "$ITERCSV" ] || echo "iter,utc,arm,score,champion,verdict,ceiling,cost_usd,cum_cost_usd,in_tokens" > "$ITERCSV"
 
 # treatment is a subdir of this monorepo; git ops are scoped to treatment/ + kbs/ so a revert
 # never touches the fixed harness/referee. (Each iteration only mutates those two paths.)
@@ -66,15 +68,19 @@ while [ "$iter" -lt "$MAX_ITERS" ]; do
   log "measured score=$score  champion=$best  promote-if>$thresh"
 
   # ---------- verdict (BEST.json local + authoritative) ----------
+  ceil=$(echo "$res" | python3 -c "import sys,json;print(json.load(sys.stdin).get('ceiling_reason','?'))" 2>/dev/null || echo '?')
   if awk -v s="$score" 'BEGIN{exit !(s<=0)}'; then
-    log "gate/build/crash failure (score 0) -> revert"; git reset --hard HEAD~1 -q; no_improve=$((no_improve+1))
+    VERDICT="revert-fail"; log "gate/build/crash failure (score 0) -> revert"; git reset --hard HEAD~1 -q; no_improve=$((no_improve+1))
   elif awk -v s="$score" -v t="$thresh" 'BEGIN{exit !(s>t)}'; then
-    log "NEW CHAMPION ($score > $thresh) -> promote"
+    VERDICT="promote"; log "NEW CHAMPION ($score > $thresh) -> promote"
     python3 -c "import json;ch='$(treat_head)';json.dump({'config_hash':ch,'score':float('$score'),'cores':$CORES,'note':'champion'},open('$BEST','w'))"
     no_improve=0
   else
-    log "not better -> revert (never keep a regression)"; git reset --hard HEAD~1 -q; no_improve=$((no_improve+1))
+    VERDICT="revert-regression"; log "not better -> revert (never keep a regression)"; git reset --hard HEAD~1 -q; no_improve=$((no_improve+1))
   fi
+  CUM_COST=$(awk -v a="$CUM_COST" -v b="${cost:-0}" 'BEGIN{printf "%.4f", a+b}')
+  printf '%d,%s,treatment,%s,%s,%s,%s,%s,%s,%s\n' "$iter" "$(date -u +%FT%TZ)" "$score" "$best" \
+    "$VERDICT" "$ceil" "${cost:-0}" "$CUM_COST" "${intok:-0}" >> "$ITERCSV"
 
   # ---------- control-drift watchdog every K iterations ----------
   if [ $((iter % K)) -eq 0 ]; then
