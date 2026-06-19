@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="278" font-family="ui-monospace,Menlo,monospace">
+<rect width="560" height="278" fill="#0d1117"/>
+<text x="210" y="26" fill="#e6edf3" font-size="16" font-weight="bold">CPU instructions per accepted connection (lower is better)</text>
+<text x="198" y="72" fill="#e6edf3" font-size="13" text-anchor="end">Go goroutine-per-conn</text>
+<rect x="210" y="44" width="260" height="46" rx="5" fill="#8b949e"/>
+<text x="478" y="72" fill="#e6edf3" font-size="13">83,250</text>
+<text x="198" y="140" fill="#e6edf3" font-size="13" text-anchor="end">vanilla io_uring</text>
+<rect x="210" y="112" width="187" height="46" rx="5" fill="#d29922"/>
+<text x="405" y="140" fill="#e6edf3" font-size="13">59,931</text>
+<text x="198" y="208" fill="#e6edf3" font-size="13" text-anchor="end">flashaccept</text>
+<rect x="210" y="180" width="85" height="46" rx="5" fill="#3fb950"/>
+<text x="303" y="208" fill="#e6edf3" font-size="13">27,363</text>
+</svg>

@@ -1,0 +1,40 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install liburing
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev build-essential
+      - name: Build library
+        run: make
+      - name: Build examples
+        run: make examples
+      - name: Smoke test (accept + serve + close)
+        run: |
+          ./examples/echo_server --port 18080 &
+          SRV=$!
+          sleep 1
+          # drive a short connection storm with a tiny C client; assert connections complete
+          cat > /tmp/probe.c <<'C'
+          #include <stdio.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <arpa/inet.h>
+          #include <sys/socket.h>
+          int main(){int ok=0;for(int i=0;i<200;i++){int fd=socket(AF_INET,SOCK_STREAM,0);
+            struct sockaddr_in a={0};a.sin_family=AF_INET;a.sin_port=htons(18080);
+            inet_pton(AF_INET,"127.0.0.1",&a.sin_addr);
+            if(connect(fd,(void*)&a,sizeof a)==0){write(fd,"GET / HTTP/1.1\r\n\r\n",18);
+              char b[64];int n=read(fd,b,sizeof b);if(n>0)ok++;}
+            close(fd);}
+            printf("completed %d/200\n",ok);return ok>=190?0:1;}
+          C
+          cc -O2 -o /tmp/probe /tmp/probe.c
+          /tmp/probe
+          kill $SRV 2>/dev/null || true

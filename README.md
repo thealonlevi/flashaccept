@@ -1,72 +1,101 @@
-# accept-bench
+<h1 align="center">flashaccept</h1>
 
-A fair, optimizable benchmark for **how CPU-efficiently a program can accept TCP connections**
-and serve a trivial fixed reply at high connection churn.
+<p align="center">
+  <b>A fast io_uring TCP accept engine for Linux.</b><br>
+  Accepts connections for <b>~3× fewer CPU instructions</b> than a goroutine-per-connection server,
+  and <b>~2.2× fewer</b> than vanilla io_uring.
+</p>
 
-Two arms, benchmarked **sequentially on the same box** (load generator on a second box):
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg"></a>
+  <img alt="C" src="https://img.shields.io/badge/C-11-555.svg">
+  <img alt="Linux io_uring" src="https://img.shields.io/badge/Linux-io__uring-orange.svg">
+</p>
 
-- **Port 30 — control:** a faithful clone of the reference proxy's accept path (Go, `SO_REUSEPORT`,
-  goroutine-per-connection, TCP_INFO adaptive scaler). FROZEN.
-- **Port 31 — treatment:** C + liburing. The thing an **autonomous optimizer agent** iterates,
-  in a loop, until it plateaus at an empirical optimum.
+---
 
-**Objective:** maximize `sustained_conn_per_sec / cores` (CPU efficiency at a fixed core
-budget). **Ceiling:** the offered rate where the accept queue backs up *or* the pinned cores
-saturate. **Anti-cheat:** every scored run must serve the exact reply bytes, pass an end-to-end
-completion audit, and drop < 0.01% of connections — or it scores 0.
+High-churn services spend a shocking fraction of their CPU just **accepting** connections —
+`accept`/`read`/`write`/`close`, one syscall each, per connection. `flashaccept` collapses that
+cost with a tuned io_uring accept path (multishot accept, registered/direct descriptors, a
+per-worker connection freelist, and `MSG_MORE` reply+FIN fusion), so each connection costs a
+fraction of the CPU.
 
-The human builds the fixed referee (control arm + loadgen + harness + scoring) once. The agent
-only ever edits `treatment/` and is judged by the scoring function. You do **not** pick the
-io_uring architecture — the agent searches the design space (multishot accept, SQPOLL,
-registered files/buffers, SQE linking, NAPI, …) and the score + git keep only what wins.
+It is **drop-in and importable** — link `libflashaccept`, give it a port and a request handler,
+and it runs an optimized accept loop per core.
 
-## Read these in order
+## Benchmark
 
-1. `docs/PROJECT.md` — the contract: arms, behavioral contract, scoring, anti-cheat gate, what
-   the agent may/may not change, success definition.
-2. `docs/CONTROL_ARM.md` — exact reference-proxy accept-mechanism reproduction (build spec).
-3. `docs/TREATMENT_ARM.md` — the optimizer's playground: requirements, milestone-0 baseline,
-   the design space.
-4. `docs/HARNESS.md` — the measurement rig + guardrails for unsupervised running.
-5. `docs/ENVIRONMENT.md` — the fixed baseline that makes sequential runs comparable.
-6. `docs/AGENT_LOOP.md` — exactly what the optimizer does each iteration.
-7. `docs/METRICS.md` — ClickHouse (analytics memory) + local files (loop state); schema and the
-   co-location caveat.
-8. `docs/OPTIMIZER_HEADLESS.md` — the optimizer is `claude -p` (headless) in a bash loop:
-   verified flags, full autonomy on the isolated box, session-rotation + `kbs/`/git memory model.
-9. `docs/TOKEN_EFFICIENCY.md` — keeping the loop cheap enough to run for days: the prompt-cache
-   TTL trap (1h vs 5min — a 100x swing), graphify as a zero-cost code map, model tiering,
-   `.claudeignore`, and tracking the optimizer's own token spend.
-10. `docs/SERVER_SETUP.md` — fresh Ubuntu 22.04 bootstrap checklist: kernel → 6.8 (HWE),
-    toolchain (liburing/Go/perf/CH/claude/graphify), cgroup v2 cpuset partitions, sysctl/NIC/IRQ
-    tuning, and the build order on a clean box.
+![benchmark](docs/benchmark.svg)
 
-## Layout
+Loopback, one pinned core, CPU-bound, fixed 512 in-flight, ~2–3% spread:
 
-```
-control/     port-30 reference-proxy-clone (Go)          [FROZEN]
-treatment/   port-31 C/liburing (own git repo)   [agent edits ONLY this]
-harness/     run.sh, ramp.conf, scoring, cgroup/pin setup,
-             optimizer-prompt.md, optimizer-system.md, mcp-clickhouse.json   [FIXED]
-loadgen/     box-2 connection storm + gate sampler          [FIXED]
-results/     HISTORY.jsonl, BEST.json, REPORT.md, baselines  [agent appends results]
-kbs/         distilled optimization lessons (INDEX.md + notes)  [optimizer writes]
-docs/        the specs above
+| server | instructions / connection | conn/s (1 core) | vs Go | vs vanilla io_uring |
+|---|---:|---:|---:|---:|
+| Go, goroutine-per-connection | 83,250 | 60,131 | 1.00× | — |
+| vanilla io_uring | 59,931 | 147,946 | 1.39× | 1.00× |
+| **flashaccept** | **27,363** | **361,282** | **3.04×** | **2.19×** |
+
+Full methodology and caveats: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+## Quick start
+
+```bash
+git clone https://github.com/thealonlevi/flashaccept.git && cd flashaccept
+sudo apt-get install -y liburing-dev build-essential
+make                       # libflashaccept.a + libflashaccept.so
+make examples && ./examples/echo_server --port 8080
 ```
 
-The optimizer is **`claude -p` (headless)** driven by `harness/run.sh`'s loop — full autonomy on
-the isolated box, one mutation per iteration, memory via a long session rotated under context
-pressure and rehydrated from `kbs/` + git history + ClickHouse. See `docs/OPTIMIZER_HEADLESS.md`.
+```c
+#include <flashaccept.h>
+#include <string.h>
 
-## Status
+/* Called when request bytes arrive. Write the reply, return its length to
+   send-then-close (return 0 to close without a reply). */
+static int handle(const char *req, int req_len, char *reply, int cap, void *user) {
+    const char *r = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    int n = (int)strlen(r);
+    memcpy(reply, r, n);
+    return n;
+}
 
-Specification + skeleton only. The four buildable pieces (control arm, loadgen, harness,
-milestone-0 treatment) are not yet implemented — see "Build order" below.
+int main(void) {
+    fa_config cfg = { .port = 8080, .multishot = 1, .direct_files = 1 }; /* workers=0 => one/core */
+    fa_server *s = fa_server_new(&cfg, handle, NULL);
+    return fa_server_run(s);   /* blocks; one optimized io_uring accept loop per core */
+}
+```
+```bash
+cc myserver.c -o myserver -lflashaccept -luring -lpthread
+```
 
-## Build order (suggested)
+Requires Linux with io_uring (kernel ≥ 5.x; multishot accept uses ≥ 5.19, with graceful fallback)
+and liburing. Full reference: [docs/API.md](docs/API.md).
 
-1. **loadgen** + **harness scoring** first — you can't trust any number without the referee.
-2. **control-frozen** arm — establish the baseline conn/s-per-core to beat.
-3. **milestone-0 treatment** — a correct, unoptimized liburing server; confirm it passes the
-   gate and scores *below* control (it should — it's not optimized yet).
-4. **AGENT_LOOP** wiring — hand it to the optimizer and let it climb.
+## How it works
+
+`flashaccept` runs one `io_uring` instance and one `SO_REUSEPORT` listening socket per worker
+(one per core by default); the kernel load-balances accepts across them. The hot path uses:
+
+- **multishot accept** — one SQE yields many accept completions
+- **registered files / direct descriptors** — accept into the ring's table, skip fd-table churn
+- **per-worker connection freelist** — no per-connection `malloc`
+- **`MSG_MORE` reply+FIN fusion** — the reply and the connection's FIN ship as one TCP segment
+- **batched submit/harvest** — one `io_uring_enter` drives many connections
+
+## How it was built
+
+flashaccept's accept engine wasn't hand-tuned — it was **discovered by an autonomous optimizer**
+that mutated a baseline io_uring server in a closed loop, scored each change on CPU instructions
+per connection, and kept only what won. The complete, reproducible research rig (benchmark, the
+Go baseline it was measured against, the metrics, and the AI optimization loop) lives in
+**[`research/`](research/)** — including the full story of how vanilla io_uring became 2.2× leaner.
+
+## About
+
+Created by **Alon Levi**, Co-Founder of **FlashProxy**. Born out of making FlashProxy's
+connection-accept path cheaper at scale.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
